@@ -1,0 +1,147 @@
+name: Public GitHub Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact existing protected tag to release, for example v0.1.0
+        required: true
+        type: string
+      confirm:
+        description: Type PUBLISH_RELEASE to authorize this release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: inputs.confirm == 'PUBLISH_RELEASE'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: github-release
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the protected tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - name: Enable Corepack
+        run: corepack enable
+      - name: Verify exact semver tag
+        run: |
+          printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null
+          version="$(node -p 'require("./apps/cli/package.json").version')"
+          test "$RELEASE_TAG" = "v${version}"
+      - name: Frozen install, build, test, and pack
+        run: |
+          corepack pnpm install --frozen-lockfile
+          corepack pnpm build
+          corepack pnpm typecheck
+          corepack pnpm test
+          corepack pnpm run pack:smoke
+      - name: Generate final manifest
+        env:
+          NETOKAY_PRIVATE_SOURCE_COMMIT: ${{ vars.NETOKAY_PRIVATE_SOURCE_COMMIT }}
+          NETOKAY_WORKER_VERSION: ${{ vars.NETOKAY_WORKER_VERSION }}
+          NETOKAY_PRODUCTION_CONTROL_URL: ${{ vars.NETOKAY_PRODUCTION_CONTROL_URL }}
+        run: |
+          version="$(node -p 'require("./apps/cli/package.json").version')"
+          tarball=".release-pack/netokay-${version}.tgz"
+          test -f "$tarball"
+          test -n "$NETOKAY_PRIVATE_SOURCE_COMMIT"
+          test -n "$NETOKAY_WORKER_VERSION"
+          test -n "$NETOKAY_PRODUCTION_CONTROL_URL"
+          test "$NETOKAY_PRODUCTION_CONTROL_URL" = "https://netokay-control.flreey.workers.dev/"
+          node scripts/release-manifest.mjs finalize \
+            --file release-manifest.json \
+            --output release-manifest.final.json \
+            --private-source-commit "$NETOKAY_PRIVATE_SOURCE_COMMIT" \
+            --public-source-commit "$(git rev-parse HEAD)" \
+            --worker-version "$NETOKAY_WORKER_VERSION" \
+            --production-control-url "$NETOKAY_PRODUCTION_CONTROL_URL" \
+            --tarball "$PWD/$tarball" \
+            --tag "$RELEASE_TAG"
+          node scripts/release-manifest.mjs validate --file release-manifest.final.json
+          node scripts/release-manifest.mjs verify --file release-manifest.final.json --tarball "$PWD/$tarball"
+
+      - name: Smoke the release tarball against Production Control
+        env:
+          NPM_CONFIG_LOGLEVEL: error
+          NPM_CONFIG_UPDATE_NOTIFIER: 'false'
+        run: |
+          version="$(node -p 'require("./apps/cli/package.json").version')"
+          tarball=".release-pack/netokay-${version}.tgz"
+          test -f "$tarball"
+          smoke_cache="$(mktemp -d)"
+          NPM_CONFIG_CACHE="$smoke_cache" npm exec --yes --package="$PWD/$tarball" -- netokay diagnose https://example.com --control netokay-public > release-smoke.json
+          node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          import { validateEvidenceBundle } from './packages/contracts/dist/index.js';
+
+          const lines = (await readFile('release-smoke.json', 'utf8'))
+            .trim()
+            .split(/\r?\n/)
+            .filter(Boolean);
+          if (lines.length !== 1) throw new Error('release smoke must emit one JSON line');
+          const bundle = JSON.parse(lines[0]);
+          if (!validateEvidenceBundle(bundle)) throw new Error('release smoke schema validation failed');
+          if (bundle.outcome !== 'ready') throw new Error('release smoke outcome is not ready');
+          if (bundle.intent?.profile_id !== 'netokay-control-s3-public')
+            throw new Error('release smoke intent mismatch');
+          const controls = bundle.observations.filter((observation) => observation.scope === 'control');
+          if (
+            controls.length === 0 ||
+            controls.some(
+              (observation) =>
+                observation.source !== 'cloudflare_control' ||
+                observation.facts?.control_environment !== 'cloudflare_public_edge',
+            )
+          )
+            throw new Error('release smoke did not prove public Control Edge');
+          NODE
+          rm -f release-smoke.json
+
+      - name: Stage release assets and verify checksums
+        run: |
+          version="$(node -p 'require("./apps/cli/package.json").version')"
+          tarball=".release-pack/netokay-${version}.tgz"
+          test -f "$tarball"
+          release_asset_dir="$(mktemp -d "$RUNNER_TEMP/netokay-release-assets.XXXXXX")"
+          printf 'RELEASE_ASSET_DIR=%s\n' "$release_asset_dir" >> "$GITHUB_ENV"
+          mv "$tarball" "$release_asset_dir/netokay-${version}.tgz"
+          mv release-manifest.final.json "$release_asset_dir/release-manifest.final.json"
+          node scripts/release-manifest.mjs verify \
+            --file "$release_asset_dir/release-manifest.final.json" \
+            --tarball "$release_asset_dir/netokay-${version}.tgz"
+          (
+            cd "$release_asset_dir"
+            sha256sum "netokay-${version}.tgz" "release-manifest.final.json" > "$GITHUB_WORKSPACE/SHA256SUMS"
+            sha256sum -c "$GITHUB_WORKSPACE/SHA256SUMS"
+          )
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p 'require("./apps/cli/package.json").version')"
+          gh release create "$RELEASE_TAG" \
+            --prerelease \
+            --title "NetOkay ${version}" \
+            --notes "Manual public release for the protected ${RELEASE_TAG} tag." \
+            "$RELEASE_ASSET_DIR/netokay-${version}.tgz" \
+            "$RELEASE_ASSET_DIR/release-manifest.final.json" \
+            SHA256SUMS

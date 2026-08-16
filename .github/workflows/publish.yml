@@ -1,0 +1,107 @@
+name: Publish netokay
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact semver version whose protected tag is published
+        required: true
+        type: string
+      confirm:
+        description: Type PUBLISH_NPM to authorize npm publication
+        required: true
+        type: string
+
+# The package does not deploy the private Worker. This job only builds the
+# public source mirror and publishes the npm package with OIDC provenance.
+# During the first bootstrap only, an operator may use a minimal, one-time
+# npm token. Once the package exists, configure Trusted Publisher for this
+# workflow and revoke that bootstrap token; no long-lived token is retained.
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: inputs.confirm == 'PUBLISH_NPM'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+    environment: npm-production
+    steps:
+      - name: Check out public source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ inputs.version }}
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+      - name: Pin npm trusted-publishing CLI
+        run: |
+          npm install --global npm@11.19.0
+          test "$(npm --version)" = "11.19.0"
+      - name: Enable Corepack
+        run: corepack enable
+      - name: Verify protected semver tag
+        run: |
+          printf '%s\n' "$RELEASE_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          git rev-parse --verify "refs/tags/v${RELEASE_VERSION}^{commit}" >/dev/null
+          version="$(node -p 'require("./apps/cli/package.json").version')"
+          test "v${RELEASE_VERSION}" = "v${version}"
+      - name: Frozen public install
+        run: corepack pnpm install --frozen-lockfile
+      - name: Build from public source
+        run: corepack pnpm build
+      - name: Typecheck and public tests
+        run: corepack pnpm typecheck && corepack pnpm test
+      - name: Pack and smoke the public source
+        run: corepack pnpm run pack:smoke
+      - name: Finalize and validate release manifest artifact
+        env:
+          NETOKAY_PRIVATE_SOURCE_COMMIT: ${{ vars.NETOKAY_PRIVATE_SOURCE_COMMIT }}
+          NETOKAY_WORKER_VERSION: ${{ vars.NETOKAY_WORKER_VERSION }}
+          NETOKAY_PRODUCTION_CONTROL_URL: ${{ vars.NETOKAY_PRODUCTION_CONTROL_URL }}
+        run: |
+          test -n "$NETOKAY_PRIVATE_SOURCE_COMMIT"
+          test -n "$NETOKAY_WORKER_VERSION"
+          test -n "$NETOKAY_PRODUCTION_CONTROL_URL"
+          public_commit="$(git rev-parse HEAD)"
+          printf '%s\n' "$public_commit" | grep -Eq '^[0-9a-f]{40}$'
+          version="$(node -p 'require("./apps/cli/package.json").version')"
+          tarball=".release-pack/netokay-${version}.tgz"
+          test -f "$tarball"
+          test "$(find .release-pack -maxdepth 1 -type f -name 'netokay-*.tgz' | wc -l | tr -d ' ')" = 1
+          node scripts/release-manifest.mjs finalize \
+            --file release-manifest.json \
+            --output release-manifest.final.json \
+            --private-source-commit "$NETOKAY_PRIVATE_SOURCE_COMMIT" \
+            --public-source-commit "$public_commit" \
+            --worker-version "$NETOKAY_WORKER_VERSION" \
+            --production-control-url "$NETOKAY_PRODUCTION_CONTROL_URL" \
+            --tarball "$PWD/$tarball" \
+            --tag "v${RELEASE_VERSION}"
+          node scripts/release-manifest.mjs validate --file release-manifest.final.json
+      - name: Store manifest and verified tarball artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: netokay-release-${{ inputs.version }}
+          path: |
+            release-manifest.final.json
+            .release-pack/netokay-*.tgz
+          if-no-files-found: error
+      - name: Publish with provenance
+        run: |
+          version="$(node -p 'require("./apps/cli/package.json").version')"
+          tarball=".release-pack/netokay-${version}.tgz"
+          node scripts/release-manifest.mjs verify --file release-manifest.final.json --tarball "$PWD/$tarball"
+          # npm publish --provenance --access public (the exact tarball follows)
+          npm publish "$tarball" --provenance --access public

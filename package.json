@@ -1,0 +1,23 @@
+{
+  "name": "netokay-cli-release-mirror",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.15.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "build": "pnpm --filter @netokay/contracts build && pnpm --filter @netokay/core build && pnpm --filter netokay build",
+    "typecheck": "pnpm --filter @netokay/contracts typecheck && pnpm --filter @netokay/core typecheck && pnpm --filter netokay typecheck",
+    "test": "vitest run tests/public",
+    "pack": "pnpm build && mkdir -p .release-pack && cd apps/cli && npm pack --json --pack-destination ../../.release-pack",
+    "pack:smoke": "pnpm run pack && node scripts/public-pack-smoke.mjs --tarball \"$PWD/.release-pack/netokay-$(node -p 'require(\"./apps/cli/package.json\").version').tgz\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "0.25.12",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+.pnpm-store/
+.vitest/
+.cache/
+.release-pack/
+*.tgz
+*.tsbuildinfo
+.env
+.env.*
+!.env.example

@@ -1,0 +1,329 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://netokay.dev/schemas/evidence-bundle.schema.json",
+  "title": "NetOkay EvidenceBundle",
+  "description": "Versioned, redacted evidence emitted by a NetOkay diagnostic run.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "bundle_id",
+    "run_status",
+    "outcome",
+    "started_at",
+    "completed_at",
+    "duration_ms",
+    "runner",
+    "execution_context",
+    "intent",
+    "policy",
+    "observations",
+    "differentials",
+    "diagnoses",
+    "redaction",
+    "completeness"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$"
+    },
+    "bundle_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "run_status": {
+      "type": "string",
+      "enum": ["completed", "rejected", "cancelled", "errored"]
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["ready", "attention", "incomplete", "rejected", "error"]
+    },
+    "started_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z$"
+    },
+    "completed_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z$"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "runner": {
+      "$ref": "#/$defs/Runner"
+    },
+    "execution_context": {
+      "$ref": "#/$defs/ExecutionContext"
+    },
+    "intent": {
+      "$ref": "#/$defs/Intent"
+    },
+    "policy": {
+      "$ref": "#/$defs/Policy"
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Observation"
+      }
+    },
+    "differentials": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Differential"
+      }
+    },
+    "diagnoses": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Diagnosis"
+      }
+    },
+    "redaction": {
+      "$ref": "#/$defs/Redaction"
+    },
+    "completeness": {
+      "$ref": "#/$defs/Completeness"
+    }
+  },
+  "$defs": {
+    "Runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cli_version", "core_version", "control_profile_version"],
+      "properties": {
+        "cli_version": { "type": "string", "minLength": 1 },
+        "core_version": { "type": "string", "minLength": 1 },
+        "control_profile_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ExecutionContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "agent_internal_runtime"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["local_shell", "agent_spawned_process", "container", "ci", "unknown"]
+        },
+        "agent_host": {
+          "type": "string",
+          "enum": ["codex", "claude_code", "cline", "unknown"]
+        },
+        "os_family": {
+          "type": "string",
+          "enum": ["darwin", "linux", "unknown"]
+        },
+        "architecture": {
+          "type": "string",
+          "enum": ["arm64", "x64", "unknown"]
+        },
+        "container": {
+          "type": "string",
+          "enum": ["true", "false", "unknown"]
+        },
+        "proxy_env_present": {
+          "type": "string",
+          "enum": ["true", "false", "unknown"]
+        },
+        "no_proxy_present": {
+          "type": "string",
+          "enum": ["true", "false", "unknown"]
+        },
+        "extra_ca_present": {
+          "type": "string",
+          "enum": ["true", "false", "unknown"]
+        },
+        "agent_internal_runtime": {
+          "type": "string",
+          "enum": ["observed", "not_observed", "unknown"]
+        }
+      }
+    },
+    "Intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "profile_id", "has_target"],
+      "properties": {
+        "transport": {
+          "type": "string",
+          "enum": ["http", "https"]
+        },
+        "profile_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "has_target": { "type": "boolean" }
+      }
+    },
+    "Policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "run_decision", "target_decision", "reasons"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "run_decision": {
+          "type": "string",
+          "enum": ["allowed", "rejected"]
+        },
+        "target_decision": {
+          "type": "string",
+          "enum": ["not_applicable", "not_requested", "skipped", "allowed", "rejected"]
+        },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "Observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_id",
+        "scope",
+        "transport",
+        "stage",
+        "status",
+        "started_at",
+        "duration_ms",
+        "result_code",
+        "facts",
+        "limitations",
+        "source"
+      ],
+      "properties": {
+        "check_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "scope": { "type": "string", "enum": ["control", "target"] },
+        "transport": { "type": "string", "enum": ["http", "https"] },
+        "stage": {
+          "type": "string",
+          "enum": ["control", "policy", "dns", "tcp", "tls", "headers"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["passed", "failed", "incomplete", "skipped", "not_observed", "cancelled"]
+        },
+        "started_at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z$"
+        },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "result_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "facts": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "source": { "type": "string", "enum": ["local_runner", "cloudflare_control"] },
+        "colo": { "type": "string", "minLength": 1, "maxLength": 32 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "passed" } },
+            "required": ["status"]
+          },
+          "then": {},
+          "else": {
+            "properties": {
+              "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "required": ["reason_code"]
+          }
+        }
+      ]
+    },
+    "Differential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["differential_id", "kind", "left_ref", "right_ref", "limitations"],
+      "properties": {
+        "differential_id": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "left_ref": { "type": "string", "minLength": 1 },
+        "right_ref": { "type": "string", "minLength": 1 },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "Diagnosis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "summary",
+        "evidence_refs",
+        "possible_layers",
+        "limitations",
+        "suggested_next_steps"
+      ],
+      "properties": {
+        "code": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "possible_layers": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "suggested_next_steps": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "Redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["not_collected", "removed", "truncated"],
+      "properties": {
+        "not_collected": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "removed": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "truncated": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "Completeness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["control", "target", "missing"],
+      "properties": {
+        "control": {
+          "type": "string",
+          "enum": ["passed", "failed", "incomplete", "not_observed", "cancelled"]
+        },
+        "target": {
+          "type": "string",
+          "enum": ["passed", "failed", "incomplete", "skipped", "cancelled", "not_applicable"]
+        },
+        "missing": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

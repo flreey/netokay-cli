@@ -1,0 +1,4 @@
+interface:
+  display_name: 'NetOkay'
+  short_description: 'Safely diagnose one public target from an AI agent'
+  default_prompt: 'Use $netokay to diagnose one public HTTP target and explain the bounded evidence.'

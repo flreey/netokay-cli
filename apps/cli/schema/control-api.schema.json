@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://netokay.dev/schemas/control-api.schema.json",
+  "title": "NetOkay Control API response",
+  "description": "The allowlisted self/echo Control API response contract.",
+  "oneOf": [
+    { "$ref": "#/$defs/ControlSelfResponse" },
+    { "$ref": "#/$defs/ControlEchoResponse" },
+    { "$ref": "#/$defs/ControlErrorResponse" }
+  ],
+  "$defs": {
+    "Version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+(?:\\.[0-9]+)?$",
+      "minLength": 3,
+      "maxLength": 24
+    },
+    "ApiVersion": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$",
+      "minLength": 3,
+      "maxLength": 16
+    },
+    "Capabilities": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["control.self", "control.echo"]
+      }
+    },
+    "RequestId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "NullableString": {
+      "anyOf": [{ "type": "string", "maxLength": 128 }, { "type": "null" }]
+    },
+    "NullableIpFamily": {
+      "anyOf": [{ "type": "string", "enum": ["ipv4", "ipv6"] }, { "type": "null" }]
+    },
+    "NullableCountry": {
+      "anyOf": [{ "type": "string", "pattern": "^[A-Za-z]{2}$" }, { "type": "null" }]
+    },
+    "NullableColo": {
+      "anyOf": [{ "type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$" }, { "type": "null" }]
+    },
+    "NullableHttpProtocol": {
+      "anyOf": [
+        { "type": "string", "enum": ["HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3"] },
+        { "type": "null" }
+      ]
+    },
+    "NullableTlsVersion": {
+      "anyOf": [{ "type": "string", "enum": ["TLSv1.2", "TLSv1.3"] }, { "type": "null" }]
+    },
+    "NonNegativeSafeInteger": {
+      "anyOf": [
+        { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        { "type": "null" }
+      ]
+    },
+    "CommonSuccess": {
+      "type": "object",
+      "required": [
+        "api_version",
+        "control_profile_version",
+        "capabilities",
+        "schema_version",
+        "observed_at",
+        "request_id"
+      ],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/ApiVersion" },
+        "control_profile_version": { "$ref": "#/$defs/Version" },
+        "capabilities": { "$ref": "#/$defs/Capabilities" },
+        "schema_version": {
+          "type": "string",
+          "pattern": "^1\\.[0-9]+$",
+          "minLength": 3,
+          "maxLength": 16
+        },
+        "observed_at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+        },
+        "request_id": { "$ref": "#/$defs/RequestId" }
+      }
+    },
+    "ControlSelfResponse": {
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/CommonSuccess" },
+        {
+          "type": "object",
+          "required": [
+            "ip_family",
+            "country",
+            "asn",
+            "colo",
+            "http_protocol",
+            "tls_version",
+            "client_tcp_rtt_ms",
+            "missing_fields"
+          ],
+          "properties": {
+            "ip_family": { "$ref": "#/$defs/NullableIpFamily" },
+            "country": { "$ref": "#/$defs/NullableCountry" },
+            "asn": {
+              "$ref": "#/$defs/NonNegativeSafeInteger"
+            },
+            "colo": { "$ref": "#/$defs/NullableColo" },
+            "http_protocol": { "$ref": "#/$defs/NullableHttpProtocol" },
+            "tls_version": { "$ref": "#/$defs/NullableTlsVersion" },
+            "client_tcp_rtt_ms": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+            "missing_fields": {
+              "type": "array",
+              "maxItems": 7,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "ip_family",
+                  "country",
+                  "asn",
+                  "colo",
+                  "http_protocol",
+                  "tls_version",
+                  "client_tcp_rtt_ms"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ControlEchoResponse": {
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/CommonSuccess" },
+        {
+          "type": "object",
+          "required": [
+            "method",
+            "x_netokay_run_id",
+            "x_netokay_challenge",
+            "x_netokay_client_version",
+            "user_agent_class"
+          ],
+          "properties": {
+            "method": { "type": "string", "enum": ["GET"] },
+            "x_netokay_run_id": { "$ref": "#/$defs/NullableString" },
+            "x_netokay_challenge": { "$ref": "#/$defs/NullableString" },
+            "x_netokay_client_version": { "$ref": "#/$defs/NullableString" },
+            "user_agent_class": {
+              "type": "string",
+              "enum": ["none", "browser", "node", "curl", "agent", "other"]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ControlErrorResponse": {
+      "type": "object",
+      "required": ["code", "message", "retryable", "request_id"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "METHOD_NOT_ALLOWED",
+            "QUERY_NOT_ALLOWED",
+            "HEADER_LIMIT_EXCEEDED",
+            "REQUEST_BODY_NOT_ALLOWED",
+            "ROUTE_NOT_FOUND",
+            "CONTROL_PROFILE_INCOMPATIBLE",
+            "INTERNAL_ERROR"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "retryable": { "type": "boolean" },
+        "request_id": { "$ref": "#/$defs/RequestId" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

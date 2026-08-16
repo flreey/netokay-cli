@@ -1,0 +1,1025 @@
+import { performance } from 'node:perf_hooks';
+import { randomUUID } from 'node:crypto';
+import { isIP } from 'node:net';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
+import {
+  runDiagnostic,
+  runDiagnosticAsync,
+  finalizeRun,
+  CORE_VERSION,
+  type DiagnosticRequest,
+  type DiagnosticPorts,
+  type ControlExecution,
+  type ExecutionCollectionMetadata,
+  type RunPolicyPort,
+  type TerminalizationFaultPort,
+} from '@netokay/core';
+import type { Observation } from '@netokay/contracts';
+import type { EvidenceBundle } from '@netokay/contracts';
+import {
+  assessControlCompatibility,
+  echoObservation,
+  failedControlObservation,
+  readControlEchoResponse,
+  readControlSelfResponse,
+  selfObservation,
+} from './control.js';
+import {
+  createNodeTransportExecutor,
+  type TransportExecutor,
+  type TransportResult,
+} from './transport.js';
+import { createTargetPort } from './target.js';
+import {
+  evaluateTargetPolicy,
+  normalizeTargetUrl,
+  rawTargetScheme,
+  type TargetPolicyDecision,
+  type TargetPolicyOptions,
+} from './target-policy.js';
+import { parsePreviewUrl } from './preview-url.js';
+import {
+  OutputError,
+  preflightEvidencePath,
+  publishEvidenceFile,
+  serializeEvidenceBundle,
+  type PublishEvidenceResult,
+  type PublishEvidenceOptions,
+} from './output.js';
+
+const CLI_VERSION = '0.1.0' as const;
+const SCHEMA_VERSION = '1.0' as const;
+const CONTROL_PROFILE_VERSION = '1.0.0' as const;
+const CONTROL_TOTAL_DEADLINE_MS = 20_000;
+const CONTROL_ATTEMPT_DEADLINE_MS = 5_000;
+export const PUBLIC_CONTROL_BASE_URL = 'https://netokay-control.flreey.workers.dev/' as const;
+type ControlMode = 'local' | 'preview' | 'public';
+
+/** The published CLI has a deliberate Node 24-only runtime contract. */
+export const isSupportedNodeRuntime = (version = process.versions.node): boolean => {
+  const major = Number.parseInt(version.split('.')[0] ?? '', 10);
+  return Number.isInteger(major) && major === 24;
+};
+
+/** Test-only application seam; production uses the deterministic defaults below. */
+export interface CliRuntimeDependencies {
+  readonly runPolicy?: RunPolicyPort;
+  readonly faults?: TerminalizationFaultPort;
+  readonly serializeEvidence?: (bundle: EvidenceBundle) => string;
+  readonly publishEvidenceFile?: (
+    path: string,
+    serialized: string,
+  ) => Promise<PublishEvidenceResult>;
+  /** Test-only publisher options; production entrypoints leave this unset. */
+  readonly publishEvidenceFileOptions?: PublishEvidenceOptions;
+  /** Test-only Preview policy seam; production always evaluates the real policy. */
+  readonly previewPolicyEvaluator?: (
+    value: string | URL,
+    options: Omit<TargetPolicyOptions, 'proxy_configured'>,
+  ) => Promise<TargetPolicyDecision>;
+  /** Test-only public Control policy seam; production always evaluates the real policy. */
+  readonly publicControlPolicyEvaluator?: (
+    value: string | URL,
+    options: Omit<TargetPolicyOptions, 'proxy_configured'>,
+  ) => Promise<TargetPolicyDecision>;
+  /** Test-only transport seam; production always uses the bounded Node executor. */
+  readonly controlTransport?: TransportExecutor;
+}
+
+const writeStdout = async (value: string): Promise<void> => {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let writeCallback = false;
+    const onError = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    process.stdout.once('error', onError);
+    try {
+      process.stdout.write(`${value}\n`, () => {
+        writeCallback = true;
+        // A closed pipe reports EPIPE immediately after the write callback on
+        // Node streams. Defer success by one turn so that error is observed
+        // and terminalized instead of becoming an uncaught process exception.
+        setImmediate(() => {
+          if (settled || !writeCallback) return;
+          settled = true;
+          resolve();
+        });
+      });
+    } catch (error) {
+      onError(error instanceof Error ? error : new Error('stdout unavailable'));
+    }
+  });
+};
+
+const writeStderr = async (value: string): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    let writeCallback = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const onError = (): void => finish();
+    process.stderr.once('error', onError);
+    try {
+      process.stderr.write(value, () => {
+        writeCallback = true;
+        setImmediate(() => {
+          if (!writeCallback) return;
+          finish();
+        });
+      });
+    } catch {
+      finish();
+    }
+  });
+};
+
+const safeStderr = async (): Promise<void> => {
+  try {
+    await writeStderr('NetOkay output unavailable.\n');
+  } catch {
+    // stderr may be unavailable too; never surface the original exception.
+  }
+};
+
+const postCommitWarning = (error: OutputError): string => {
+  if (!error.cleanup_complete) {
+    return 'NetOkay output warning: committed Evidence retained; temporary cleanup incomplete.\n';
+  }
+  if (!error.directory_synced) {
+    return 'NetOkay output warning: committed Evidence retained; directory durability not confirmed.\n';
+  }
+  return 'NetOkay output warning: committed Evidence retained after output fault.\n';
+};
+
+const writePostCommitWarning = async (error: OutputError): Promise<void> => {
+  try {
+    await writeStderr(postCommitWarning(error));
+  } catch {
+    // stderr may be unavailable; the committed Bundle remains authoritative.
+  }
+};
+
+const defaultRunPolicy: RunPolicyPort = {
+  evaluate: (request) => {
+    if (
+      !request ||
+      (request.transport !== 'http' && request.transport !== 'https') ||
+      typeof request.profile_id !== 'string' ||
+      request.profile_id.length === 0 ||
+      request.profile_id.length > 128
+    ) {
+      return { decision: 'reject', reason_code: 'RUN_POLICY_REJECTED' };
+    }
+    return { decision: 'allow' };
+  },
+};
+
+const terminalErrorBundle = (
+  request: DiagnosticRequest,
+  dependencies: CliRuntimeDependencies = {},
+): EvidenceBundle =>
+  finalizeRun({
+    request,
+    ports: ports(dependencies),
+    status: 'errored',
+    controlObservations: [],
+    targetObservations: [],
+    targetPolicy: request.target
+      ? { target_decision: 'skipped', reasons: ['RUN_INTERNAL_ERROR'] }
+      : { target_decision: 'not_applicable', reasons: ['RUN_INTERNAL_ERROR'] },
+  });
+
+const emitBundle = async (
+  request: DiagnosticRequest,
+  bundle: EvidenceBundle,
+  outputPath?: string,
+  dependencies: CliRuntimeDependencies = {},
+): Promise<number> => {
+  let serialized: string | undefined;
+  let committed = false;
+  let stdoutAttempted = false;
+  let committedWarning: OutputError | undefined;
+  const primarySerializer = dependencies.serializeEvidence ?? serializeEvidenceBundle;
+  const publisher =
+    dependencies.publishEvidenceFile ??
+    ((path: string, value: string) =>
+      publishEvidenceFile(path, value, dependencies.publishEvidenceFileOptions));
+  try {
+    serialized = primarySerializer(bundle);
+    if (outputPath) {
+      const result = await publisher(outputPath, serialized);
+      committed = result.committed;
+      if (result.committed && (!result.cleanup_complete || !result.directory_synced)) {
+        committedWarning = new OutputError(
+          !result.cleanup_complete
+            ? 'OUTPUT_COMMITTED_CLEANUP_INCOMPLETE'
+            : 'OUTPUT_COMMITTED_DURABILITY_UNCONFIRMED',
+          'committed Evidence retained after output fault',
+          true,
+          result.cleanup_complete,
+          result.directory_synced,
+        );
+      }
+    }
+    stdoutAttempted = true;
+    await writeStdout(serialized);
+    if (committedWarning) await writePostCommitWarning(committedWarning);
+    return exitCodeFor(bundle.outcome);
+  } catch (error) {
+    if (error instanceof OutputError && error.committed) committedWarning = error;
+    if (committed || committedWarning) {
+      try {
+        if (stdoutAttempted) {
+          if (committedWarning) await writePostCommitWarning(committedWarning);
+          else await safeStderr();
+          return exitCodeFor(bundle.outcome);
+        }
+        if (!stdoutAttempted && serialized !== undefined) {
+          stdoutAttempted = true;
+          await writeStdout(serialized);
+        }
+        if (committedWarning) await writePostCommitWarning(committedWarning);
+        return exitCodeFor(bundle.outcome);
+      } catch {
+        if (committedWarning) await writePostCommitWarning(committedWarning);
+        else await safeStderr();
+        return exitCodeFor(bundle.outcome);
+      }
+    }
+    if (error instanceof OutputError || error instanceof Error) {
+      if (stdoutAttempted) {
+        await safeStderr();
+        return 4;
+      }
+      try {
+        const fallback = terminalErrorBundle(request, dependencies);
+        stdoutAttempted = true;
+        await writeStdout(serializeEvidenceBundle(fallback));
+        return 4;
+      } catch {
+        await safeStderr();
+        return 4;
+      }
+    }
+    await safeStderr();
+    return 4;
+  }
+};
+
+const detectExecutionContext = (): DiagnosticRequest['execution_context'] => {
+  const platform = process.platform;
+  const architecture = process.arch;
+  const isContainer = process.env.NETOKAY_CONTAINER === '1';
+  const proxyEnvPresent = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY'].some(
+    (key) => process.env[key] !== undefined,
+  );
+  return {
+    kind: process.env.CI ? 'ci' : isContainer ? 'container' : 'local_shell',
+    agent_host: 'unknown',
+    os_family: platform === 'darwin' || platform === 'linux' ? platform : 'unknown',
+    architecture: architecture === 'arm64' || architecture === 'x64' ? architecture : 'unknown',
+    container: isContainer ? 'true' : 'unknown',
+    proxy_env_present: proxyEnvPresent ? 'true' : 'false',
+    no_proxy_present: process.env.NO_PROXY === undefined ? 'false' : 'true',
+    extra_ca_present: 'unknown',
+    agent_internal_runtime: 'not_observed',
+  };
+};
+
+const ports = (dependencies: CliRuntimeDependencies = {}): DiagnosticPorts => ({
+  clock: {
+    now: () => new Date().toISOString(),
+    monotonic_ms: () => performance.now(),
+  },
+  ids: { next: () => `netokay_${randomUUID()}` },
+  versions: {
+    cli: CLI_VERSION,
+    core: CORE_VERSION,
+    schema: SCHEMA_VERSION,
+    control_profile: CONTROL_PROFILE_VERSION,
+  },
+  runPolicy: dependencies.runPolicy ?? defaultRunPolicy,
+  faults: dependencies.faults,
+});
+
+const schemaPath = (): string =>
+  fileURLToPath(new URL('../schema/evidence-bundle.schema.json', import.meta.url));
+
+const printVersion = (): Record<string, string> => ({
+  cli_version: CLI_VERSION,
+  evidence_schema_version: SCHEMA_VERSION,
+  control_profile_version: CONTROL_PROFILE_VERSION,
+});
+
+const printSchema = (): Record<string, string> => {
+  const path = schemaPath();
+  return {
+    schema_version: SCHEMA_VERSION,
+    schema_format: 'json-schema-2020-12',
+    schema_path: path,
+    schema_uri: new URL('../schema/evidence-bundle.schema.json', import.meta.url).href,
+  };
+};
+
+const isLoopbackHost = (hostname: string): boolean => {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (normalized === 'localhost') return true;
+  const family = isIP(normalized);
+  if (family === 4) {
+    const firstOctet = Number(normalized.split('.')[0]);
+    return firstOctet === 127;
+  }
+  return family === 6 && normalized === '::1';
+};
+
+export const parseControlBaseUrl = (value: string, allowPreviewEdge = false): URL | null => {
+  if (allowPreviewEdge) return parsePreviewUrl(value);
+  try {
+    const url = new URL(value);
+    if (
+      !['http:', 'https:'].includes(url.protocol) ||
+      url.username !== '' ||
+      url.password !== '' ||
+      url.search !== '' ||
+      url.hash !== '' ||
+      url.pathname !== '/' ||
+      !isLoopbackHost(url.hostname)
+    ) {
+      return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Preview Control has a stricter DNS boundary than the ordinary loopback
+ * Control URL. Callers must use the canonical workers.dev Preview hostname,
+ * and only public addresses returned by this one policy evaluation may reach
+ * the transport socket.
+ */
+export const evaluatePreviewControlPolicy = async (
+  value: string | URL,
+  options: Omit<TargetPolicyOptions, 'proxy_configured'> = {},
+): Promise<TargetPolicyDecision> => {
+  const url = parsePreviewUrl(typeof value === 'string' ? value : value.href);
+  if (!url) {
+    return {
+      kind: 'blocked',
+      reason_code: 'TARGET_POLICY_BLOCKED',
+      safe_reason: 'invalid_target',
+    };
+  }
+  return evaluateTargetPolicy(url.href, { ...options, proxy_configured: false });
+};
+
+/**
+ * Public Control is a fixed, production-only root. It uses the same complete
+ * DNS/IP policy and approved-address socket pinning as Preview, but is never
+ * selected from arbitrary caller input.
+ */
+export const evaluatePublicControlPolicy = async (
+  value: string | URL,
+  options: Omit<TargetPolicyOptions, 'proxy_configured'> = {},
+): Promise<TargetPolicyDecision> => {
+  let url: URL;
+  try {
+    url = typeof value === 'string' ? new URL(value) : value;
+  } catch {
+    return {
+      kind: 'blocked',
+      reason_code: 'TARGET_POLICY_BLOCKED',
+      safe_reason: 'invalid_target',
+    };
+  }
+  if (url.href !== PUBLIC_CONTROL_BASE_URL) {
+    return {
+      kind: 'blocked',
+      reason_code: 'TARGET_POLICY_BLOCKED',
+      safe_reason: 'invalid_target',
+    };
+  }
+  return evaluateTargetPolicy(url.href, { ...options, proxy_configured: false });
+};
+
+const transportReason = (transport: TransportResult): string => {
+  if (transport.phase === 'timeout') return 'CONTROL_TIMEOUT';
+  if (transport.phase === 'cancelled') return 'CONTROL_CANCELLED';
+  if (transport.phase === 'response_too_large') return 'CONTROL_RESPONSE_TOO_LARGE';
+  return 'CONTROL_UNAVAILABLE';
+};
+
+const exitCodeFor = (outcome: string): number =>
+  outcome === 'ready'
+    ? 0
+    : outcome === 'attention'
+      ? 1
+      : outcome === 'incomplete'
+        ? 2
+        : outcome === 'rejected'
+          ? 3
+          : 4;
+
+const intentTransportForTarget = (target: string | undefined): 'http' | 'https' => {
+  if (!target) return 'https';
+  const normalized = normalizeTargetUrl(target);
+  return normalized.ok ? normalized.value.scheme : rawTargetScheme(target);
+};
+
+const runControlDiagnose = async (
+  baseUrl: URL,
+  target?: string,
+  outputPath?: string,
+  dependencies: CliRuntimeDependencies = {},
+  mode: ControlMode = 'local',
+): Promise<number> => {
+  const executor =
+    dependencies.controlTransport ?? createNodeTransportExecutor({ maxResponseBytes: 32 * 1024 });
+  const runId = `run_${randomUUID()}`;
+  const challenge = randomUUID();
+  const controller = new AbortController();
+  const started = Date.now();
+  const deadlineAt = started + CONTROL_TOTAL_DEADLINE_MS;
+  const deadlineTimer = setTimeout(() => controller.abort(), CONTROL_TOTAL_DEADLINE_MS);
+  const onSigint = (): void => controller.abort();
+  process.once('SIGINT', onSigint);
+  const remotePreview = mode !== 'local';
+  type ControlObservationContext = {
+    source: 'cloudflare_control' | 'local_runner';
+    environment: string;
+    actualScheme: string;
+  };
+  const unverifiedContext: ControlObservationContext = {
+    source: 'local_runner',
+    environment:
+      mode === 'public'
+        ? 'cloudflare_public_unverified'
+        : mode === 'preview'
+          ? 'cloudflare_preview_unverified'
+          : 'local_loopback_harness',
+    actualScheme: baseUrl.protocol.replace(':', ''),
+  };
+  const verifiedContext: ControlObservationContext = remotePreview
+    ? {
+        source: 'cloudflare_control',
+        environment: mode === 'public' ? 'cloudflare_public_edge' : 'cloudflare_edge',
+        actualScheme: baseUrl.protocol.replace(':', ''),
+      }
+    : unverifiedContext;
+  const previewPolicy = remotePreview
+    ? await (
+        mode === 'public'
+          ? (dependencies.publicControlPolicyEvaluator ?? evaluatePublicControlPolicy)
+          : (dependencies.previewPolicyEvaluator ?? evaluatePreviewControlPolicy)
+      )(baseUrl, {
+        signal: controller.signal,
+        deadlineAt,
+      })
+    : null;
+  const approvedControlAddresses =
+    previewPolicy?.kind === 'allowed' ? previewPolicy.approved_ips : undefined;
+  const approvedControlSocket = (result: TransportResult): boolean =>
+    Boolean(
+      result.remoteAddress &&
+      approvedControlAddresses?.some(
+        (address) => address.toLowerCase() === result.remoteAddress!.toLowerCase(),
+      ),
+    );
+  const executionContext = detectExecutionContext();
+  const targetPort = target
+    ? createTargetPort({
+        executor,
+        proxyConfigured: executionContext.proxy_env_present === 'true',
+      })
+    : undefined;
+  const requestOptions = (runDeadlineAt: number, signal: AbortSignal = controller.signal) => ({
+    deadlineAt: Math.min(deadlineAt, runDeadlineAt),
+    signal,
+    ...(approvedControlAddresses
+      ? { approvedAddresses: approvedControlAddresses, serverName: baseUrl.hostname }
+      : {}),
+    headers: {
+      'x-netokay-run-id': runId,
+      'x-netokay-challenge': challenge,
+      'x-netokay-client-version': CLI_VERSION,
+    },
+  });
+  let collection: ExecutionCollectionMetadata = {};
+  const parse = (result: TransportResult): unknown | null => {
+    if (result.statusCode !== null) {
+      collection = { ...collection, control_response_headers_read: true };
+    }
+    if (result.phase === 'response_complete' && result.body !== null) {
+      collection = { ...collection, control_response_body_parsed: true };
+    }
+    if (result.phase !== 'response_complete' || result.statusCode !== 200 || result.body === null) {
+      return null;
+    }
+    try {
+      return JSON.parse(result.body) as unknown;
+    } catch {
+      return null;
+    }
+  };
+  const whenStarted = (startedAt: string): string => {
+    const runMs = new Date(startedAt).getTime();
+    return new Date(Math.max(Date.now(), runMs)).toISOString();
+  };
+  const durationFrom = (startedAt: string): number =>
+    Math.max(0, Date.now() - new Date(startedAt).getTime());
+  const failure = (
+    checkId: 'control-self' | 'control-echo',
+    result: TransportResult,
+    startedAt: string,
+    context: ControlObservationContext,
+  ): Observation => {
+    const reason = transportReason(result);
+    return failedControlObservation(
+      checkId,
+      result.phase === 'cancelled' ? 'cancelled' : 'incomplete',
+      reason,
+      reason,
+      startedAt,
+      durationFrom(startedAt),
+      context,
+    );
+  };
+  const request: DiagnosticRequest = {
+    transport: intentTransportForTarget(target),
+    profile_id: target
+      ? mode === 'public'
+        ? 'netokay-control-s3-public'
+        : 'netokay-control-s3-local'
+      : mode === 'public'
+        ? 'netokay-control-s2-public'
+        : 'netokay-control-s2-local',
+    target,
+    execution_context: executionContext,
+    policy_version: target
+      ? mode === 'public'
+        ? 's3-target-policy-public'
+        : 's3-target-policy'
+      : mode === 'public'
+        ? 's2-control-only-public'
+        : 's2-control-only',
+  };
+  const controlPort = {
+    execute: async (
+      _request: DiagnosticRequest,
+      runContext: { startedAt: string; signal: AbortSignal; deadlineAt: number },
+    ): Promise<ControlExecution> => {
+      const observations: Observation[] = [];
+      const startedAt = runContext.startedAt;
+      if (previewPolicy?.kind === 'blocked') {
+        const failureReason =
+          mode === 'public' ? 'CONTROL_PUBLIC_UNVERIFIED' : 'CONTROL_PREVIEW_UNVERIFIED';
+        observations.push(
+          failedControlObservation(
+            'control-self',
+            'incomplete',
+            failureReason,
+            failureReason,
+            startedAt,
+            durationFrom(startedAt),
+            unverifiedContext,
+          ),
+          failedControlObservation(
+            'control-echo',
+            'incomplete',
+            failureReason,
+            failureReason,
+            whenStarted(startedAt),
+            durationFrom(startedAt),
+            unverifiedContext,
+          ),
+        );
+        return { observations, collection, runStatus: 'completed' };
+      }
+      const selfResult = await executor.request(
+        new URL('/v1/control/self', baseUrl),
+        requestOptions(
+          Math.min(runContext.deadlineAt, Date.now() + CONTROL_ATTEMPT_DEADLINE_MS),
+          runContext.signal,
+        ),
+      );
+      const selfBody = parse(selfResult);
+      if (selfBody === null) {
+        const failed = failure('control-self', selfResult, startedAt, unverifiedContext);
+        observations.push(failed);
+        return {
+          observations,
+          collection,
+          runStatus: runContext.signal.aborted ? 'cancelled' : 'completed',
+        };
+      }
+      const selfCompatibility = assessControlCompatibility(selfBody);
+      if (!selfCompatibility.compatible) {
+        observations.push(
+          failedControlObservation(
+            'control-self',
+            'incomplete',
+            'CONTROL_PROFILE_INCOMPATIBLE',
+            'CONTROL_PROFILE_INCOMPATIBLE',
+            startedAt,
+            durationFrom(startedAt),
+            unverifiedContext,
+          ),
+        );
+        return { observations, collection };
+      }
+      const selfRead = readControlSelfResponse(selfBody);
+      if (!selfRead.ok) {
+        observations.push(
+          failedControlObservation(
+            'control-self',
+            'incomplete',
+            selfRead.reasonCode,
+            selfRead.reasonCode,
+            startedAt,
+            durationFrom(startedAt),
+            unverifiedContext,
+          ),
+        );
+        return { observations, collection };
+      }
+      if (
+        remotePreview &&
+        (!approvedControlSocket(selfResult) ||
+          selfResult.authorized !== true ||
+          selfRead.value.colo === null ||
+          selfRead.value.colo === '')
+      ) {
+        const failureReason =
+          mode === 'public' ? 'CONTROL_PUBLIC_UNVERIFIED' : 'CONTROL_PREVIEW_UNVERIFIED';
+        observations.push(
+          failedControlObservation(
+            'control-self',
+            'incomplete',
+            failureReason,
+            failureReason,
+            startedAt,
+            durationFrom(startedAt),
+            unverifiedContext,
+          ),
+        );
+        return { observations, collection, runStatus: 'completed' };
+      }
+      observations.push(
+        selfObservation(
+          selfRead.value,
+          startedAt,
+          durationFrom(startedAt),
+          mode === 'public' ? unverifiedContext : verifiedContext,
+        ),
+      );
+      if (runContext.signal.aborted) {
+        const cancelled = failure(
+          'control-echo',
+          {
+            phase: 'cancelled',
+            statusCode: null,
+            headers: new Headers(),
+            body: null,
+            errorCode: 'ABORTED',
+          },
+          whenStarted(startedAt),
+          unverifiedContext,
+        );
+        observations.push(cancelled);
+        return { observations, collection, runStatus: 'cancelled' };
+      }
+      const echoStarted = whenStarted(startedAt);
+      const echoResult = await executor.request(
+        new URL('/v1/control/echo', baseUrl),
+        requestOptions(
+          Math.min(runContext.deadlineAt, Date.now() + CONTROL_ATTEMPT_DEADLINE_MS),
+          runContext.signal,
+        ),
+      );
+      const echoBody = parse(echoResult);
+      if (echoBody === null) {
+        const failed = failure('control-echo', echoResult, echoStarted, unverifiedContext);
+        observations.push(failed);
+        return {
+          observations,
+          collection,
+          runStatus: runContext.signal.aborted ? 'cancelled' : 'completed',
+        };
+      }
+      if (remotePreview && (!approvedControlSocket(echoResult) || echoResult.authorized !== true)) {
+        const failureReason =
+          mode === 'public' ? 'CONTROL_PUBLIC_UNVERIFIED' : 'CONTROL_PREVIEW_UNVERIFIED';
+        observations.push(
+          failedControlObservation(
+            'control-echo',
+            'incomplete',
+            failureReason,
+            failureReason,
+            echoStarted,
+            durationFrom(echoStarted),
+            unverifiedContext,
+          ),
+        );
+        return { observations, collection, runStatus: 'completed' };
+      }
+      const echoCompatibility = assessControlCompatibility(echoBody);
+      if (!echoCompatibility.compatible) {
+        observations.push(
+          failedControlObservation(
+            'control-echo',
+            'incomplete',
+            'CONTROL_PROFILE_INCOMPATIBLE',
+            'CONTROL_PROFILE_INCOMPATIBLE',
+            echoStarted,
+            durationFrom(echoStarted),
+            unverifiedContext,
+          ),
+        );
+        return { observations, collection };
+      }
+      const rawEcho = echoBody as Record<string, unknown>;
+      const mismatchedFields = [
+        ['x_netokay_run_id', runId, rawEcho.x_netokay_run_id],
+        ['x_netokay_challenge', challenge, rawEcho.x_netokay_challenge],
+        ['x_netokay_client_version', CLI_VERSION, rawEcho.x_netokay_client_version],
+      ]
+        .filter(([, sent, received]) => sent !== received)
+        .map(([field]) => field);
+      if (mismatchedFields.length > 0) {
+        observations.push(
+          failedControlObservation(
+            'control-echo',
+            'failed',
+            'REQUEST_MUTATION_OBSERVED',
+            'REQUEST_MUTATION_OBSERVED',
+            echoStarted,
+            durationFrom(echoStarted),
+            unverifiedContext,
+            { mismatched_fields: mismatchedFields },
+          ),
+        );
+        return {
+          observations,
+          collection,
+          runStatus: runContext.signal.aborted ? 'cancelled' : 'completed',
+        };
+      }
+      const echoRead = readControlEchoResponse(echoBody);
+      if (!echoRead.ok) {
+        observations.push(
+          failedControlObservation(
+            'control-echo',
+            'incomplete',
+            echoRead.reasonCode,
+            echoRead.reasonCode,
+            echoStarted,
+            durationFrom(echoStarted),
+            unverifiedContext,
+          ),
+        );
+        return { observations, collection };
+      }
+      const echo = echoRead.value;
+      if (mode === 'public') {
+        observations[0] = selfObservation(
+          selfRead.value,
+          startedAt,
+          durationFrom(startedAt),
+          verifiedContext,
+        );
+      }
+      observations.push(
+        echoObservation(echo, echoStarted, durationFrom(echoStarted), verifiedContext),
+      );
+      return {
+        observations,
+        collection,
+        runStatus: runContext.signal.aborted ? 'cancelled' : 'completed',
+      };
+    },
+  };
+  try {
+    const bundle = await runDiagnosticAsync(
+      request,
+      { ...ports(dependencies), control: controlPort, target: targetPort },
+      {
+        signal: controller.signal,
+        deadlineAt,
+      },
+    );
+    return emitBundle(request, bundle, outputPath, dependencies);
+  } finally {
+    clearTimeout(deadlineTimer);
+    process.removeListener('SIGINT', onSigint);
+  }
+};
+
+const runTargetOnlyDiagnose = async (
+  target: string,
+  outputPath?: string,
+  dependencies: CliRuntimeDependencies = {},
+): Promise<number> => {
+  const executor = createNodeTransportExecutor({ maxResponseBytes: 32 * 1024 });
+  const controller = new AbortController();
+  const deadlineAt = Date.now() + CONTROL_TOTAL_DEADLINE_MS;
+  const deadlineTimer = setTimeout(() => controller.abort(), CONTROL_TOTAL_DEADLINE_MS);
+  const onSigint = (): void => controller.abort();
+  process.once('SIGINT', onSigint);
+  const executionContext = detectExecutionContext();
+  const targetPort = createTargetPort({
+    executor,
+    proxyConfigured: executionContext.proxy_env_present === 'true',
+  });
+  const request: DiagnosticRequest = {
+    transport: intentTransportForTarget(target),
+    profile_id: 'netokay-control-s3-local',
+    target,
+    execution_context: executionContext,
+    policy_version: 's3-target-policy',
+  };
+  try {
+    const bundle = await runDiagnosticAsync(
+      request,
+      { ...ports(dependencies), target: targetPort },
+      { signal: controller.signal, deadlineAt },
+    );
+    return emitBundle(request, bundle, outputPath, dependencies);
+  } finally {
+    clearTimeout(deadlineTimer);
+    process.removeListener('SIGINT', onSigint);
+  }
+};
+
+const runDiagnose = async (
+  target: string | undefined,
+  controlBaseUrl?: URL,
+  outputPath?: string,
+  dependencies: CliRuntimeDependencies = {},
+  controlMode: ControlMode = 'local',
+): Promise<number> => {
+  if (controlBaseUrl)
+    return runControlDiagnose(controlBaseUrl, target, outputPath, dependencies, controlMode);
+  if (target) return runTargetOnlyDiagnose(target, outputPath, dependencies);
+  const request: DiagnosticRequest = {
+    transport: 'https',
+    profile_id: 'netokay-control-s1',
+    target,
+    execution_context: detectExecutionContext(),
+  };
+  const bundle = runDiagnostic(request, ports(dependencies));
+  return emitBundle(request, bundle, outputPath, dependencies);
+};
+
+const requestForCliDiagnose = (
+  target: string | undefined,
+  controlBaseUrl: URL | undefined,
+  controlMode: ControlMode = 'local',
+): DiagnosticRequest => ({
+  transport: intentTransportForTarget(target),
+  profile_id: controlBaseUrl
+    ? target
+      ? controlMode === 'public'
+        ? 'netokay-control-s3-public'
+        : 'netokay-control-s3-local'
+      : controlMode === 'public'
+        ? 'netokay-control-s2-public'
+        : 'netokay-control-s2-local'
+    : target
+      ? 'netokay-control-s3-local'
+      : 'netokay-control-s1',
+  target,
+  execution_context: detectExecutionContext(),
+  policy_version: controlBaseUrl
+    ? target
+      ? controlMode === 'public'
+        ? 's3-target-policy-public'
+        : 's3-target-policy'
+      : controlMode === 'public'
+        ? 's2-control-only-public'
+        : 's2-control-only'
+    : target
+      ? 's3-target-policy'
+      : undefined,
+});
+
+const usage = (): string =>
+  'Usage: netokay <version|schema|diagnose [target] [--control netokay-public | --control-base-url <loopback-http-url> [--preview-edge]] [--out <path>]>\n';
+
+export async function main(
+  argv: readonly string[] = process.argv.slice(2),
+  dependencies: CliRuntimeDependencies = {},
+): Promise<number> {
+  if (!isSupportedNodeRuntime()) {
+    await writeStderr('NetOkay requires Node 24.\n');
+    return 64;
+  }
+  const [command, ...rest] = argv;
+  if (!command || command === '--help' || command === '-h') {
+    await writeStderr(usage());
+    return command ? 0 : 64;
+  }
+  if (command === 'version' && rest.length === 0) {
+    try {
+      await writeStdout(JSON.stringify(printVersion()));
+      return 0;
+    } catch {
+      await safeStderr();
+      return 4;
+    }
+  }
+  if (command === 'schema' && rest.length === 0) {
+    try {
+      await writeStdout(JSON.stringify(printSchema()));
+      return 0;
+    } catch {
+      await safeStderr();
+      return 4;
+    }
+  }
+  if (command === 'diagnose') {
+    let target: string | undefined;
+    let controlBaseUrl: URL | undefined;
+    let outputPath: string | undefined;
+    let previewEdge = false;
+    let controlMode: ControlMode = 'local';
+    try {
+      const parsed = parseArgs({
+        args: rest,
+        options: {
+          control: { type: 'string' },
+          'control-base-url': { type: 'string' },
+          'preview-edge': { type: 'boolean' },
+          out: { type: 'string' },
+        },
+        allowPositionals: true,
+        strict: true,
+      });
+      if (parsed.positionals.length > 1) throw new Error('too many positionals');
+      target = parsed.positionals[0];
+      previewEdge = parsed.values['preview-edge'] === true;
+      const controlValue = parsed.values['control-base-url'];
+      if (controlValue !== undefined && typeof controlValue !== 'string') {
+        throw new Error('invalid control URL');
+      }
+      if (previewEdge && controlValue === undefined) throw new Error('invalid control URL');
+      const selectedControl = parsed.values.control;
+      if (selectedControl !== undefined && typeof selectedControl !== 'string') {
+        throw new Error('invalid control selector');
+      }
+      if (selectedControl !== undefined) {
+        if (selectedControl !== 'netokay-public') throw new Error('invalid control selector');
+        if (controlValue !== undefined || previewEdge) throw new Error('incompatible control');
+        controlMode = 'public';
+        controlBaseUrl = new URL(PUBLIC_CONTROL_BASE_URL);
+      }
+      if (controlValue !== undefined) {
+        const parsedControlBaseUrl = parseControlBaseUrl(controlValue, previewEdge);
+        if (parsedControlBaseUrl === null) throw new Error('invalid control URL');
+        controlBaseUrl = parsedControlBaseUrl;
+        if (previewEdge) controlMode = 'preview';
+      }
+      const outputValue = parsed.values.out;
+      if (outputValue !== undefined && typeof outputValue !== 'string') {
+        throw new Error('invalid output path');
+      }
+      if (outputValue !== undefined) outputPath = await preflightEvidencePath(outputValue);
+    } catch (error) {
+      await writeStderr(`${usage()}Invalid arguments.\n`);
+      return 64;
+    }
+    try {
+      return await runDiagnose(target, controlBaseUrl, outputPath, dependencies, controlMode);
+    } catch {
+      const request = requestForCliDiagnose(target, controlBaseUrl, controlMode);
+      const bundle = terminalErrorBundle(request, dependencies);
+      return emitBundle(request, bundle, outputPath, dependencies);
+    }
+  }
+  await writeStderr(`${usage()}Invalid arguments.\n`);
+  return 64;
+}
+
+const isEntrypoint =
+  process.argv[1] !== undefined && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isEntrypoint) {
+  void main().then(
+    (code) => {
+      process.exitCode = code;
+    },
+    () => {
+      void safeStderr().then(() => {
+        process.exitCode = 4;
+      });
+    },
+  );
+}

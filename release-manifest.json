@@ -1,0 +1,23 @@
+{
+  "manifest_version": 1,
+  "phase": "prepare",
+  "allowlist_version": "1",
+  "exporter_version": "1.0.0",
+  "private_source_commit": "9abb0703b643480bdbb47a961aa1394e08b95143",
+  "public_source_commit": null,
+  "worker_version": null,
+  "npm_version": "0.1.0",
+  "production_control_url": null,
+  "schema_hashes": {
+    "control": "6272d78cf0922d86a2cae1e04f88089d17ee28a8dc80c886d9eb05ad17f9d439",
+    "evidence": "d17492d92384193291fff4713e50af9abbbc47075f5797bb08b4cdd383777024"
+  },
+  "tarball_sha256": null,
+  "version_matrix": {
+    "cli": "0.1.0",
+    "core": "0.1.0",
+    "contracts": "0.1.0",
+    "schema": "1.0",
+    "control_profile": "1.0.0"
+  }
+}

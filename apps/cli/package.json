@@ -1,0 +1,41 @@
+{
+  "name": "netokay",
+  "version": "0.1.0",
+  "description": "NetOkay executable diagnostic contract spine",
+  "type": "module",
+  "bin": {
+    "netokay": "dist/netokay.js"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "license": "Apache-2.0",
+  "files": [
+    "dist/netokay.js",
+    "schema/evidence-bundle.schema.json",
+    "schema/control-api.schema.json",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "prepack": "corepack pnpm --dir ../.. build >/dev/null",
+    "build": "node ../../scripts/build-cli.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "ipaddr.js": "2.5.0"
+  },
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/flreey/netokay-cli.git"
+  },
+  "homepage": "https://github.com/flreey/netokay-cli#readme",
+  "bugs": {
+    "url": "https://github.com/flreey/netokay-cli/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
+}
