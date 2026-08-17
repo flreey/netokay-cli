@@ -54,7 +54,7 @@ const SCHEMA_VERSION = '1.0' as const;
 const CONTROL_PROFILE_VERSION = '1.0.0' as const;
 const CONTROL_TOTAL_DEADLINE_MS = 20_000;
 const CONTROL_ATTEMPT_DEADLINE_MS = 5_000;
-export const PUBLIC_CONTROL_BASE_URL = 'https://netokay-control.flreey.workers.dev/' as const;
+export const PUBLIC_CONTROL_BASE_URL = 'https://netokay.net/' as const;
 type ControlMode = 'local' | 'preview' | 'public';
 
 /** The published CLI has a deliberate Node 24-only runtime contract. */

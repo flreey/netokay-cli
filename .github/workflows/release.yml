@@ -66,7 +66,7 @@ jobs:
           test -n "$NETOKAY_PRIVATE_SOURCE_COMMIT"
           test -n "$NETOKAY_WORKER_VERSION"
           test -n "$NETOKAY_PRODUCTION_CONTROL_URL"
-          test "$NETOKAY_PRODUCTION_CONTROL_URL" = "https://netokay-control.flreey.workers.dev/"
+          test "$NETOKAY_PRODUCTION_CONTROL_URL" = "https://netokay.net/"
           node scripts/release-manifest.mjs finalize \
             --file release-manifest.json \
             --output release-manifest.final.json \
@@ -88,7 +88,7 @@ jobs:
           tarball=".release-pack/netokay-${version}.tgz"
           test -f "$tarball"
           smoke_cache="$(mktemp -d)"
-          NPM_CONFIG_CACHE="$smoke_cache" npm exec --yes --package="$PWD/$tarball" -- netokay diagnose https://example.com --control netokay-public > release-smoke.json
+          NPM_CONFIG_CACHE="$smoke_cache" npm exec --yes --package="$PWD/$tarball" -- netokay diagnose https://github.com --control netokay-public > release-smoke.json
           node --input-type=module <<'NODE'
           import { readFile } from 'node:fs/promises';
           import { validateEvidenceBundle } from './packages/contracts/dist/index.js';
