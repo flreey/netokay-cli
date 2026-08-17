@@ -88,7 +88,7 @@ jobs:
           tarball=".release-pack/netokay-${version}.tgz"
           test -f "$tarball"
           smoke_cache="$(mktemp -d)"
-          NPM_CONFIG_CACHE="$smoke_cache" npm exec --yes --package="$PWD/$tarball" -- netokay diagnose https://github.com --control netokay-public > release-smoke.json
+          NPM_CONFIG_CACHE="$smoke_cache" npm exec --yes --package="$PWD/$tarball" -- netokay diagnose https://github.com > release-smoke.json
           node --input-type=module <<'NODE'
           import { readFile } from 'node:fs/promises';
           import { validateEvidenceBundle } from './packages/contracts/dist/index.js';
@@ -108,11 +108,11 @@ jobs:
             controls.length === 0 ||
             controls.some(
               (observation) =>
-                observation.source !== 'cloudflare_control' ||
-                observation.facts?.control_environment !== 'cloudflare_public_edge',
+                observation.source !== 'netokay_control' ||
+                observation.facts?.control_environment !== 'netokay_public_service',
             )
           )
-            throw new Error('release smoke did not prove public Control Edge');
+            throw new Error('release smoke did not prove the public service');
           NODE
           rm -f release-smoke.json
 

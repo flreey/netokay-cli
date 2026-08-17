@@ -17,8 +17,24 @@ const run = async (command, args, cwd, options = {}) =>
     timeout: options.timeout ?? timeout,
     killSignal: 'SIGKILL',
     maxBuffer: options.maxBuffer ?? maxBuffer,
-    env: { ...process.env, npm_config_loglevel: 'error', npm_config_update_notifier: 'false' },
+    env: {
+      ...process.env,
+      npm_config_loglevel: 'error',
+      npm_config_update_notifier: 'false',
+      ...(options.env ?? {}),
+    },
   });
+
+const unavailableProxyEnv = () => ({
+  HTTP_PROXY: 'http://127.0.0.1:1',
+  HTTPS_PROXY: 'http://127.0.0.1:1',
+  ALL_PROXY: 'http://127.0.0.1:1',
+  NO_PROXY: '',
+  http_proxy: 'http://127.0.0.1:1',
+  https_proxy: 'http://127.0.0.1:1',
+  all_proxy: 'http://127.0.0.1:1',
+  no_proxy: '',
+});
 
 const arg = (name) => {
   const index = process.argv.indexOf(name);
@@ -93,7 +109,9 @@ const main = async () => {
     const schema = jsonLine(await run(bin, ['schema'], temp), 'schema');
     if (!schema.schema_path?.endsWith('evidence-bundle.schema.json'))
       throw new Error('schema output mismatch');
-    const diagnosis = await run(bin, ['diagnose'], temp).catch((error) => error);
+    const diagnosis = await run(bin, ['diagnose'], temp, { env: unavailableProxyEnv() }).catch(
+      (error) => error,
+    );
     if (diagnosis.code !== 2 || diagnosis.stderr !== '')
       throw new Error('diagnose exit/output mismatch');
     const evidenceBundle = JSON.parse((diagnosis.stdout ?? '').trim());

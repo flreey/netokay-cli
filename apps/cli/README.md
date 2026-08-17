@@ -1,13 +1,36 @@
 # netokay
 
-Installable NetOkay CLI. `diagnose <target>` accepts one policy-approved public `http:80` or `https:443` target and performs a bounded, cold-connection HEAD through the shared TransportExecutor. Without `--control-base-url`, Control remains the honest S1 `not_observed` lane; with it, only an explicit loopback HTTP Control URL is accepted for local development/testing. The opt-in `--preview-edge` flag permits only an explicit HTTPS root Control URL without credentials, query, or fragment and marks trusted Control observations as `cloudflare_control`; it never selects a URL implicitly. Target policy blocks proxy-hidden destinations and non-public addresses, while Evidence retains only safe stage facts and no target URL, full IP, headers or body. Local Control Evidence is marked `local_runner` with the actual `http` scheme and explicit TLS/Cloudflare Edge limitations; SIGINT produces a schema-valid cancelled Bundle.
+Installable NetOkay CLI. Run `netokay diagnose [target] [--out <path>]` to
+perform one bounded, read-only check. The CLI always uses the fixed
+`https://netokay.net/` public service; the target itself is executed only by
+the local runner. Evidence is schema-valid, redacted, and fail-closed.
 
-`diagnose [target] --out <path>` additionally writes the same schema-validated JSON to a new `0600` file using an atomic no-clobber publication. Existing targets, symlinks, and unsafe parent directories are rejected before a diagnostic Run is created; successful Evidence is never deleted automatically.
+The public command surface is deliberately small:
 
-This npm package is a CLI-only executable distribution. It does not promise an `import('netokay')` library API; invoke the `netokay` binary (or its `dist/netokay.js` ESM entry) instead.
+```text
+netokay version
+netokay schema
+netokay diagnose [target] [--out <path>]
+```
 
-For the public release contract, use the fixed production selector with one
-explicit public target: `netokay diagnose <target> --control netokay-public`.
-Arbitrary remote Control URLs are not accepted. The public repository, npm
-package, and Production service remain pending until their separate release
-gates are completed.
+`--out` atomically publishes a new `0600` file without clobbering an existing
+path. This npm package is an executable-only distribution; invoke the `netokay`
+binary (or its `dist/netokay.js` ESM entry) rather than relying on an import
+library API.
+
+The package does not accept service, preview, proxy, certificate, or DNS
+overrides. At runtime it automatically follows the invoking process's
+`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` and `NO_PROXY` rules; on macOS it may
+also use static system HTTP(S) proxy settings and their exception list. A
+proxy route can leave the final target IP not observed, which is recorded by
+safe route facts without emitting proxy URLs, hosts, ports, or credentials.
+Control self/echo requests explicitly negotiate JSON; target HEAD requests use
+the neutral `Accept: */*` so content negotiation does not imply a JSON API.
+When a proxy hides the destination, target Evidence omits unobservable address
+counts and IP-family fields. Transport phase facts use `duration_observed` and
+only expose `attempt_count` with `attempt_count_observed: true` when the target
+attempt is observable; otherwise the count is omitted and the flag is false.
+An explicitly configured proxy that this runtime cannot execute fails before
+any socket is opened; it is never silently downgraded to a direct request.
+Local harnesses retain their own test-only dependency injection seams outside
+the public command surface.

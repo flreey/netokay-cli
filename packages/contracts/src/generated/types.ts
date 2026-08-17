@@ -17,7 +17,7 @@ facts: {
 [k: string]: unknown
 }
 limitations: string[]
-source: ("local_runner" | "cloudflare_control")
+source: ("local_runner" | "netokay_control")
 colo?: string
 })
 

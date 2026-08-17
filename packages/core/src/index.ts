@@ -8,7 +8,7 @@ import {
   type Policy,
 } from '@netokay/contracts';
 
-export const CORE_VERSION = '0.1.0' as const;
+export const CORE_VERSION = '0.2.0' as const;
 
 export type ExecutionContextInput = Pick<ExecutionContext, 'kind' | 'agent_internal_runtime'> &
   Partial<Omit<ExecutionContext, 'kind' | 'agent_internal_runtime'>>;
@@ -630,7 +630,7 @@ const buildErroredBundle = (input: FinalizeRunInput): EvidenceBundle => {
   const epoch = '1970-01-01T00:00:00.000Z';
   const startedAt = isIsoTimestamp(input.startedAt) ? input.startedAt : safeClockNow(ports, epoch);
   const completedAt = safeClockNow(ports, epoch);
-  const schemaVersion = /^1\.[0-9]+$/.test(ports.versions.schema) ? ports.versions.schema : '1.0';
+  const schemaVersion = /^2\.[0-9]+$/.test(ports.versions.schema) ? ports.versions.schema : '2.0';
   const evidenceContext = contextForEvidence(request.execution_context);
   const errorDiagnoses: Diagnosis[] = [
     {

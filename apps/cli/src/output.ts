@@ -359,18 +359,18 @@ const SUMMARY_TEXT = new Set([
 
 const LIMITATION_TEXT = new Set([
   'Agent internal runtime remains not observed.',
-  'TLS was observed and certificate verification was performed for the Preview Edge.',
-  'Cloudflare Edge was observed for the Preview smoke.',
-  'Preview Control trust, TLS authorization or Edge self evidence was not proven.',
-  'Cloudflare Edge was not observed for the Preview smoke.',
-  'Public Control trust, TLS authorization or Edge self evidence was not proven.',
-  'Cloudflare Edge was observed for public Control.',
-  'Cloudflare Edge was not observed for public Control.',
-  'TLS was observed and certificate verification was performed for public Control.',
-  'TLS was attempted with default certificate verification for public Control.',
+  'TLS was observed and certificate verification was performed for the test service.',
+  'The test service was observed.',
+  'Test service trust, TLS authorization or self evidence was not proven.',
+  'The test service was not observed.',
+  'Public service trust, TLS authorization or self evidence was not proven.',
+  'NetOkay public service was observed.',
+  'NetOkay public service was not observed.',
+  'TLS was observed and certificate verification was performed for the NetOkay public service.',
+  'TLS was attempted with default certificate verification for the NetOkay public service.',
   'TLS was observed and certificate verification was performed for the local loopback harness.',
-  'Cloudflare Edge was not observed for the local loopback harness.',
-  'TLS and Cloudflare Edge were not observed for the local loopback harness.',
+  'NetOkay public service was not observed for the local loopback harness.',
+  'TLS and the NetOkay public service were not observed for the local loopback harness.',
   'S1 does not perform network requests.',
   'The diagnostic lane failed before producing a complete observation.',
   'Only the invoking runtime is observed.',
@@ -380,7 +380,7 @@ const LIMITATION_TEXT = new Set([
   'Internal details are intentionally omitted.',
   'Cancellation may have occurred before a lane emitted an observation.',
   'A trusted Control response was not available for this check.',
-  'TLS was attempted with default certificate verification for the Preview Edge.',
+  'TLS was attempted with default certificate verification for the test service.',
   'TLS was attempted with default certificate verification for the local loopback harness.',
   'The Control response or transport was not available for this check.',
   'Full target URL, IP addresses, certificate chain and raw headers/body are not retained.',
@@ -430,14 +430,14 @@ const safeStringByKey = (key: string | undefined, value: string): boolean => {
   if (key === 'suggested_next_steps') return false;
   if (key === 'bundle_id') return /^(?:bundle|netokay)[_-][A-Za-z0-9._-]{1,127}$/.test(value);
   if (key === 'profile_id') return PROFILE_IDS.has(value);
-  if (key === 'schema_version') return /^1\.[0-9]+$/.test(value);
+  if (key === 'schema_version') return /^2\.[0-9]+$/.test(value);
   if (key === 'version') return /^[a-z0-9][A-Za-z0-9._-]{1,63}$/.test(value);
   if (key === 'reasons' || key === 'result_code' || key === 'reason_code' || key === 'code') {
     return STABLE_REASON_CODES.has(value);
   }
   if (key === 'check_id') return /^(?:control|target)-[A-Za-z0-9._-]{1,96}$/.test(value);
   if (key === 'transport') return value === 'http' || value === 'https';
-  if (key === 'source') return value === 'local_runner' || value === 'cloudflare_control';
+  if (key === 'source') return value === 'local_runner' || value === 'netokay_control';
   if (key === 'colo') return /^[A-Za-z0-9_-]{1,32}$/.test(value);
   if (key === 'scope') return value === 'control' || value === 'target';
   if (key === 'stage') return ['control', 'policy', 'dns', 'tcp', 'tls', 'headers'].includes(value);
@@ -511,13 +511,26 @@ const safeFact = (key: string, value: unknown): boolean => {
     case 'control_environment':
       return (
         value === 'local_loopback_harness' ||
-        value === 'cloudflare_edge' ||
-        value === 'cloudflare_preview_unverified' ||
-        value === 'cloudflare_public_unverified' ||
-        value === 'cloudflare_public_edge'
+        value === 'netokay_test_service' ||
+        value === 'netokay_test_unverified' ||
+        value === 'netokay_public_unverified' ||
+        value === 'netokay_public_service'
       );
     case 'actual_scheme':
       return value === 'http' || value === 'https';
+    case 'route_kind':
+      return value === 'direct' || value === 'proxy';
+    case 'route_source':
+      return (
+        value === 'direct' ||
+        value === 'environment' ||
+        value === 'system' ||
+        value === 'transparent'
+      );
+    case 'resolution_source':
+      return value === 'local' || value === 'proxy';
+    case 'destination_ip_observed':
+      return typeof value === 'boolean';
     case 'ip_family':
       return value === null || value === 'ipv4' || value === 'ipv6';
     case 'country':
@@ -603,6 +616,8 @@ const safeFact = (key: string, value: unknown): boolean => {
     case 'location_present':
     case 'redirect_present':
     case 'body_observed':
+    case 'duration_observed':
+    case 'attempt_count_observed':
       return typeof value === 'boolean';
     case 'status':
       return (

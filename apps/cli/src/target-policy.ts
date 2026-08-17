@@ -1,5 +1,10 @@
 import { Resolver } from 'node:dns/promises';
 import ipaddr from 'ipaddr.js';
+import {
+  isTransparentProxyAddress,
+  type NetworkRoute,
+  type NetworkRouteResolver,
+} from './network-route.js';
 
 export interface TargetResolver {
   readonly resolve: (
@@ -41,12 +46,16 @@ export interface TargetPolicyAllowed {
   readonly approved_ips: readonly string[];
   readonly ip_families: readonly ('ipv4' | 'ipv6')[];
   readonly dns_duration_ms: number;
+  readonly route?: NetworkRoute;
 }
 
 export type TargetPolicyDecision = TargetPolicyAllowed | TargetPolicyBlocked;
 
 export interface TargetPolicyOptions {
   readonly resolver?: TargetResolver;
+  readonly routeResolver?: NetworkRouteResolver;
+  readonly route?: NetworkRoute;
+  /** @deprecated retained as a test seam; proxy routes are no longer blocked. */
   readonly proxy_configured?: boolean;
   readonly signal?: AbortSignal;
   readonly deadlineAt?: number;
@@ -376,7 +385,40 @@ export const evaluateTargetPolicy = async (
   if (options.deadlineAt !== undefined && options.deadlineAt <= Date.now()) {
     return blocked('target_dns_timeout', normalized);
   }
-  if (options.proxy_configured) return blocked('destination_ip_not_observed', normalized);
+
+  // Route selection is performed before DNS so a proxy route never performs a
+  // local lookup that could be mistaken for the destination address. The
+  // deprecated boolean remains useful for old unit seams, but now models the
+  // same successful proxy route rather than blocking the target.
+  const route: NetworkRoute = options.proxy_configured
+    ? {
+        route_kind: 'proxy',
+        route_source: 'environment',
+        resolution_source: 'proxy',
+        destination_ip_observed: false,
+      }
+    : (options.route ??
+      (() => {
+        try {
+          return (
+            options.routeResolver ?? {
+              resolve: () => ({
+                route_kind: 'direct' as const,
+                route_source: 'direct' as const,
+                resolution_source: 'local' as const,
+                destination_ip_observed: true,
+              }),
+            }
+          ).resolve(new URL(`${normalized.protocol}//${normalized.hostname}${normalized.path}`));
+        } catch {
+          return {
+            route_kind: 'direct' as const,
+            route_source: 'direct' as const,
+            resolution_source: 'local' as const,
+            destination_ip_observed: true,
+          };
+        }
+      })());
 
   if (ipaddr.isValid(normalized.hostname)) {
     const publicAddress = isPublicAddress(normalized.hostname);
@@ -384,9 +426,21 @@ export const evaluateTargetPolicy = async (
     return {
       kind: 'allowed',
       normalized,
-      approved_ips: [publicAddress.address],
+      approved_ips: route.route_kind === 'proxy' ? [] : [publicAddress.address],
       ip_families: [publicAddress.family],
       dns_duration_ms: 0,
+      route,
+    };
+  }
+
+  if (route.route_kind === 'proxy') {
+    return {
+      kind: 'allowed',
+      normalized,
+      approved_ips: [],
+      ip_families: [],
+      dns_duration_ms: 0,
+      route,
     };
   }
 
@@ -415,19 +469,25 @@ export const evaluateTargetPolicy = async (
   }
   const seen = new Set<string>();
   const approved: Array<{ readonly address: string; readonly family: 'ipv4' | 'ipv6' }> = [];
+  const allTransparent = resolved.length > 0 && resolved.every(isTransparentProxyAddress);
   for (const value of resolved) {
+    const transparent = isTransparentProxyAddress(value);
     const publicAddress = isPublicAddress(value);
-    if (!publicAddress)
+    if ((!publicAddress && !transparent) || (transparent && !allTransparent))
       return blocked(
         'target_dns_forbidden_address',
         normalized,
         Math.max(0, Date.now() - dnsStartedAt),
       );
-    const parsed = ipaddr.parse(publicAddress.address);
-    const key = `${publicAddress.family}:${parsed.toNormalizedString()}`;
+    const candidate = publicAddress ?? {
+      address: value,
+      family: 'ipv4' as const,
+    };
+    const parsed = ipaddr.parse(candidate.address);
+    const key = `${candidate.family}:${parsed.toNormalizedString()}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    approved.push(publicAddress);
+    approved.push(candidate);
   }
   const dnsDurationMs = Math.max(0, Date.now() - dnsStartedAt);
   if (approved.length === 0) return blocked('target_dns_failed', normalized, dnsDurationMs);
@@ -454,5 +514,14 @@ export const evaluateTargetPolicy = async (
     approved_ips: selected.map(({ address }) => address),
     ip_families: [...new Set(selected.map(({ family }) => family))],
     dns_duration_ms: dnsDurationMs,
+    route: allTransparent
+      ? {
+          ...route,
+          route_kind: 'proxy',
+          route_source: 'transparent',
+          resolution_source: 'proxy',
+          destination_ip_observed: false,
+        }
+      : route,
   };
 };

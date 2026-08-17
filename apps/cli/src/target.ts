@@ -13,10 +13,13 @@ import {
   type TargetResolver,
 } from './target-policy.js';
 import type { TransportExecutor, TransportResult } from './transport.js';
+import { routeFacts, type NetworkRouteResolver } from './network-route.js';
 
 export interface TargetPortOptions {
   readonly executor: TransportExecutor;
   readonly resolver?: TargetResolver;
+  readonly routeResolver?: NetworkRouteResolver;
+  /** @deprecated retained for compatibility with existing test seams. */
   readonly proxyConfigured: boolean;
 }
 
@@ -25,11 +28,44 @@ const nowIso = (): string => new Date().toISOString();
 const durationSince = (startedAt: string): number =>
   Math.max(0, Date.now() - new Date(startedAt).getTime());
 
-const phaseDuration = (
+type TransportPhaseStage = 'dns' | 'tcp' | 'tls' | 'headers';
+
+const phaseMeasurement = (
   result: TransportResult,
-  stage: 'dns' | 'tcp' | 'tls' | 'headers',
-  fallback: number,
-): number => Math.max(0, Math.round(result.phaseTimings?.[stage] ?? fallback));
+  stage: TransportPhaseStage,
+): { readonly durationMs: number; readonly observed: boolean } => {
+  const duration = result.phaseTimings?.[stage];
+  return duration === undefined || !Number.isFinite(duration)
+    ? { durationMs: 0, observed: false }
+    : { durationMs: Math.max(0, Math.round(duration)), observed: true };
+};
+
+const destinationFacts = (
+  decision: Extract<TargetPolicyDecision, { kind: 'allowed' }>,
+): Record<string, unknown> =>
+  decision.route?.destination_ip_observed === false
+    ? {}
+    : {
+        address_count: decision.approved_ips.length,
+        ip_families: [...decision.ip_families],
+      };
+
+const attemptFacts = (
+  decision: Extract<TargetPolicyDecision, { kind: 'allowed' }>,
+  result: TransportResult,
+): Record<string, unknown> => {
+  const pathObserved =
+    decision.route?.route_kind !== 'proxy' || decision.route.route_source === 'transparent';
+  const attemptCount = result.attemptCount;
+  const observed =
+    pathObserved &&
+    typeof attemptCount === 'number' &&
+    Number.isSafeInteger(attemptCount) &&
+    attemptCount > 0;
+  return observed
+    ? { attempt_count: attemptCount, attempt_count_observed: true }
+    : { attempt_count_observed: false };
+};
 
 const transportFor = (scheme: 'http' | 'https'): Observation['transport'] => scheme;
 
@@ -71,8 +107,8 @@ const policyObservation = (
     duration_ms: durationSince(startedAt),
     result_code: 'TARGET_POLICY_ALLOWED',
     facts: {
-      address_count: decision.approved_ips.length,
-      ip_families: [...decision.ip_families],
+      ...destinationFacts(decision),
+      ...routeFacts(decision.route),
     },
     limitations: [limitation],
     source: 'local_runner',
@@ -92,8 +128,8 @@ const dnsObservation = (
   duration_ms: decision.dns_duration_ms,
   result_code: 'TARGET_DNS_PASSED',
   facts: {
-    address_count: decision.approved_ips.length,
-    ip_families: [...decision.ip_families],
+    ...destinationFacts(decision),
+    ...routeFacts(decision.route),
   },
   limitations: [limitation],
   source: 'local_runner',
@@ -160,7 +196,7 @@ const phaseFailure = (
   startedAt: string,
   signal: AbortSignal,
 ): Observation => {
-  const stage: Observation['stage'] =
+  const stage: TransportPhaseStage =
     result.failedStage === 'headers'
       ? 'headers'
       : result.failedStage === 'tls'
@@ -182,6 +218,7 @@ const phaseFailure = (
             : stage === 'dns'
               ? 'TARGET_DNS_FAILED'
               : 'TARGET_TCP_FAILED';
+  const timing = phaseMeasurement(result, stage);
   return {
     check_id: `target-${stage}`,
     scope: 'target',
@@ -189,12 +226,14 @@ const phaseFailure = (
     stage,
     status: cancelled ? 'cancelled' : result.phase === 'timeout' ? 'incomplete' : 'failed',
     started_at: startedAt,
-    duration_ms: phaseDuration(result, stage, durationSince(startedAt)),
+    duration_ms: timing.durationMs,
     result_code: reasonCode,
     reason_code: reasonCode,
     facts: {
-      attempt_count: result.attemptCount ?? 0,
+      ...attemptFacts(decision, result),
+      duration_observed: timing.observed,
       phase_timings_ms: result.phaseTimings ?? {},
+      ...routeFacts(decision.route),
       ...(result.errorCode === 'TARGET_UNEXPECTED_BODY' ? { body_observed: true } : {}),
     },
     limitations: [limitation],
@@ -207,6 +246,8 @@ const successObservations = (
   result: TransportResult,
   startedAt: string,
 ): Observation[] => {
+  const destinationIpObserved = decision.route?.destination_ip_observed !== false;
+  const tcpTiming = phaseMeasurement(result, 'tcp');
   const observations: Observation[] = [
     {
       check_id: 'target-tcp',
@@ -215,19 +256,22 @@ const successObservations = (
       stage: 'tcp',
       status: 'passed',
       started_at: startedAt,
-      duration_ms: phaseDuration(result, 'tcp', durationSince(startedAt)),
+      duration_ms: tcpTiming.durationMs,
       result_code: 'TARGET_TCP_PASSED',
       facts: {
-        attempt_count: result.attemptCount ?? 0,
-        address_count: decision.approved_ips.length,
-        ip_family: familyOf(result.remoteAddress),
+        ...attemptFacts(decision, result),
+        ...destinationFacts(decision),
+        ...(destinationIpObserved ? { ip_family: familyOf(result.remoteAddress) } : {}),
+        duration_observed: tcpTiming.observed,
         phase_timings_ms: result.phaseTimings ?? {},
+        ...routeFacts(decision.route),
       },
       limitations: [limitation],
       source: 'local_runner',
     },
   ];
   if (decision.normalized.scheme === 'https') {
+    const tlsTiming = phaseMeasurement(result, 'tls');
     observations.push({
       check_id: 'target-tls',
       scope: 'target',
@@ -235,20 +279,23 @@ const successObservations = (
       stage: 'tls',
       status: result.authorized === false ? 'failed' : 'passed',
       started_at: startedAt,
-      duration_ms: phaseDuration(result, 'tls', durationSince(startedAt)),
+      duration_ms: tlsTiming.durationMs,
       result_code: result.authorized === false ? 'TARGET_TLS_FAILED' : 'TARGET_TLS_PASSED',
       ...(result.authorized === false ? { reason_code: 'TARGET_TLS_FAILED' } : {}),
       facts: {
-        attempt_count: result.attemptCount ?? 0,
+        ...attemptFacts(decision, result),
+        duration_observed: tlsTiming.observed,
         phase_timings_ms: result.phaseTimings ?? {},
         tls_protocol: result.tlsProtocol ?? null,
         alpn_protocol: result.alpnProtocol ?? null,
         authorized: result.authorized ?? false,
+        ...routeFacts(decision.route),
       },
       limitations: [limitation],
       source: 'local_runner',
     });
   }
+  const headersTiming = phaseMeasurement(result, 'headers');
   observations.push({
     check_id: 'target-headers',
     scope: 'target',
@@ -256,11 +303,13 @@ const successObservations = (
     stage: 'headers',
     status: 'passed',
     started_at: startedAt,
-    duration_ms: phaseDuration(result, 'headers', durationSince(startedAt)),
+    duration_ms: headersTiming.durationMs,
     result_code: 'TARGET_HEADERS_PASSED',
     facts: {
-      attempt_count: result.attemptCount ?? 0,
+      ...attemptFacts(decision, result),
+      duration_observed: headersTiming.observed,
       phase_timings_ms: result.phaseTimings ?? {},
+      ...routeFacts(decision.route),
       status: result.statusCode,
       status_class: result.statusCode === null ? null : Math.floor(result.statusCode / 100),
       content_type: safeContentType(result.headers),
@@ -290,6 +339,7 @@ export const createTargetPort = (options: TargetPortOptions): TargetPort => ({
     const startedAt = context.startedAt || nowIso();
     const policyOptions: TargetPolicyOptions = {
       resolver: options.resolver,
+      routeResolver: options.routeResolver,
       proxy_configured: options.proxyConfigured,
       signal: context.signal,
       deadlineAt: Math.min(context.deadlineAt, Date.now() + 3_000),
@@ -346,13 +396,18 @@ export const createTargetPort = (options: TargetPortOptions): TargetPort => ({
       };
     }
     observations.push(dnsObservation(decision, startedAt));
+    const hasTransparentSyntheticAddresses = decision.route?.route_source === 'transparent';
+    const pinsTransportAddress =
+      decision.route?.route_kind !== 'proxy' || hasTransparentSyntheticAddresses;
     const result = await options.executor.request(makeTargetUrl(decision), {
       method: 'HEAD',
-      approvedAddresses: decision.approved_ips,
+      headers: { accept: '*/*' },
+      ...(pinsTransportAddress ? { approvedAddresses: decision.approved_ips } : {}),
       serverName: decision.normalized.hostname,
       readBody: false,
       deadlineAt: Math.min(context.deadlineAt, Date.now() + 10_000),
       signal: context.signal,
+      route: decision.route,
     });
     if (result.phase === 'response_complete') {
       observations.push(...successObservations(decision, result, startedAt));
@@ -365,7 +420,9 @@ export const createTargetPort = (options: TargetPortOptions): TargetPort => ({
       collection: {
         ...policyCollection,
         ...(result.statusCode !== null ? { target_response_headers_read: true } : {}),
-        ...(result.remoteAddress !== null ? { target_socket_address_verified: true } : {}),
+        ...(pinsTransportAddress && result.remoteAddress !== null
+          ? { target_socket_address_verified: true }
+          : {}),
       },
       runStatus: context.signal.aborted || result.phase === 'cancelled' ? 'cancelled' : 'completed',
     };
