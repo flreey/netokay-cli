@@ -43,13 +43,18 @@ After a GitHub Release exists, the one-shot CLI fallback is:
 
 ```text
 npm exec --yes --package=https://github.com/flreey/netokay-cli/releases/download/v0.1.0/netokay-0.1.0.tgz -- netokay version
-npm exec --yes --package=https://github.com/flreey/netokay-cli/releases/download/v0.1.0/netokay-0.1.0.tgz -- netokay diagnose https://example.com --control netokay-public
+npm exec --yes --package=https://github.com/flreey/netokay-cli/releases/download/v0.1.0/netokay-0.1.0.tgz -- netokay diagnose https://github.com --control netokay-public
 ```
 
 The v0.1.0 GitHub Release is the current test-build distribution. Its fixed
 tarball URL and the Production Control selected by `netokay-public` are checked
 as part of the protected Release workflow. npm publication remains pending;
 review the emitted evidence before sharing it.
+
+The current `main` source targets `https://netokay.net/` as the canonical
+Production Control root. The immutable v0.1.0 test build continues to target
+the retained `workers.dev` compatibility route until a separately authorized
+future release is published.
 
 `release-manifest.json` is a prepare-phase asset. The final manifest is created
 in the protected release runtime after the public commit, Worker version,

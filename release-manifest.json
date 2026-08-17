@@ -3,7 +3,7 @@
   "phase": "prepare",
   "allowlist_version": "1",
   "exporter_version": "1.0.0",
-  "private_source_commit": "9abb0703b643480bdbb47a961aa1394e08b95143",
+  "private_source_commit": "83fe5f794175e35df01f21ffe90ce380f4d4fa31",
   "public_source_commit": null,
   "worker_version": null,
   "npm_version": "0.1.0",
