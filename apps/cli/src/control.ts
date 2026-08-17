@@ -1,5 +1,6 @@
 import { type ControlEchoResponse, type ControlSelfResponse } from '@netokay/contracts';
 import type { Observation } from '@netokay/contracts';
+import { routeFacts, type NetworkRoute } from './network-route.js';
 
 export const CONTROL_API_MAJOR = 1 as const;
 export const CONTROL_PROFILE_MAJOR = 1 as const;
@@ -216,12 +217,14 @@ export interface ControlObservationContext {
   readonly source?: Observation['source'];
   readonly environment?: string;
   readonly actualScheme?: string;
+  readonly route?: NetworkRoute;
 }
 
 const contextDefaults = (context: ControlObservationContext = {}) => ({
   source: context.source ?? 'local_runner',
   environment: context.environment ?? 'local_loopback_harness',
   actualScheme: context.actualScheme ?? 'http',
+  route: context.route,
 });
 
 const transportFor = (actualScheme: string): Observation['transport'] =>
@@ -229,39 +232,39 @@ const transportFor = (actualScheme: string): Observation['transport'] =>
 
 const limitationsFor = (actualScheme: string, environment: string): string[] =>
   actualScheme === 'https'
-    ? environment === 'cloudflare_public_unverified'
+    ? environment === 'netokay_public_unverified'
       ? [
           'Agent internal runtime remains not observed.',
-          'Public Control trust, TLS authorization or Edge self evidence was not proven.',
-          'Cloudflare Edge was not observed for public Control.',
+          'Public service trust, TLS authorization or self evidence was not proven.',
+          'NetOkay public service was not observed.',
         ]
-      : environment === 'cloudflare_public_edge'
+      : environment === 'netokay_public_service'
         ? [
             'Agent internal runtime remains not observed.',
-            'TLS was observed and certificate verification was performed for public Control.',
-            'Cloudflare Edge was observed for public Control.',
+            'TLS was observed and certificate verification was performed for the NetOkay public service.',
+            'NetOkay public service was observed.',
           ]
-        : environment === 'cloudflare_preview_unverified'
+        : environment === 'netokay_test_unverified'
           ? [
               'Agent internal runtime remains not observed.',
-              'Preview Control trust, TLS authorization or Edge self evidence was not proven.',
-              'Cloudflare Edge was not observed for the Preview smoke.',
+              'Test service trust, TLS authorization or self evidence was not proven.',
+              'The test service was not observed.',
             ]
-          : environment === 'cloudflare_edge'
+          : environment === 'netokay_test_service'
             ? [
                 'Agent internal runtime remains not observed.',
-                'TLS was observed and certificate verification was performed for the Preview Edge.',
-                'Cloudflare Edge was observed for the Preview smoke.',
+                'TLS was observed and certificate verification was performed for the test service.',
+                'The test service was observed.',
               ]
             : [
                 'Agent internal runtime remains not observed.',
                 'TLS was observed and certificate verification was performed for the local loopback harness.',
-                'Cloudflare Edge was not observed for the local loopback harness.',
+                'NetOkay public service was not observed for the local loopback harness.',
               ]
     : [
         'Agent internal runtime remains not observed.',
         `Actual Control scheme observed by this runner: ${actualScheme}.`,
-        'TLS and Cloudflare Edge were not observed for the local loopback harness.',
+        'TLS and the NetOkay public service were not observed for the local loopback harness.',
       ];
 
 export const selfObservation = (
@@ -270,7 +273,7 @@ export const selfObservation = (
   durationMs: number,
   context: ControlObservationContext = {},
 ): Observation => {
-  const { source, environment, actualScheme } = contextDefaults(context);
+  const { source, environment, actualScheme, route } = contextDefaults(context);
   return {
     check_id: 'control-self',
     scope: 'control',
@@ -287,6 +290,7 @@ export const selfObservation = (
       capabilities: [...body.capabilities],
       control_environment: environment,
       actual_scheme: actualScheme,
+      ...routeFacts(route),
       ip_family: safeFact(body.ip_family),
       country: safeFact(body.country),
       asn: safeFact(body.asn),
@@ -308,7 +312,7 @@ export const echoObservation = (
   durationMs: number,
   context: ControlObservationContext = {},
 ): Observation => {
-  const { source, environment, actualScheme } = contextDefaults(context);
+  const { source, environment, actualScheme, route } = contextDefaults(context);
   return {
     check_id: 'control-echo',
     scope: 'control',
@@ -326,6 +330,7 @@ export const echoObservation = (
       user_agent_class: body.user_agent_class,
       control_environment: environment,
       actual_scheme: actualScheme,
+      ...routeFacts(route),
     },
     limitations: limitationsFor(actualScheme, environment),
     source,
@@ -342,7 +347,7 @@ export const failedControlObservation = (
   context: ControlObservationContext = {},
   facts: Record<string, unknown> = {},
 ): Observation => {
-  const { source, environment, actualScheme } = contextDefaults(context);
+  const { source, environment, actualScheme, route } = contextDefaults(context);
   return {
     check_id: checkId,
     scope: 'control',
@@ -353,42 +358,47 @@ export const failedControlObservation = (
     duration_ms: durationMs,
     result_code: resultCode,
     reason_code: reasonCode,
-    facts: { ...facts, control_environment: environment, actual_scheme: actualScheme },
+    facts: {
+      ...facts,
+      control_environment: environment,
+      actual_scheme: actualScheme,
+      ...routeFacts(route),
+    },
     limitations:
       actualScheme === 'https'
-        ? environment === 'cloudflare_public_unverified'
+        ? environment === 'netokay_public_unverified'
           ? [
               'A trusted Control response was not available for this check.',
-              'Public Control trust, TLS authorization or Edge self evidence was not proven.',
-              'Cloudflare Edge was not observed for public Control.',
+              'Public service trust, TLS authorization or self evidence was not proven.',
+              'NetOkay public service was not observed.',
             ]
-          : environment === 'cloudflare_public_edge'
+          : environment === 'netokay_public_service'
             ? [
                 'A trusted Control response was not available for this check.',
-                'TLS was attempted with default certificate verification for public Control.',
-                'Cloudflare Edge was observed for public Control.',
+                'TLS was attempted with default certificate verification for the NetOkay public service.',
+                'NetOkay public service was observed.',
               ]
-            : environment === 'cloudflare_preview_unverified'
+            : environment === 'netokay_test_unverified'
               ? [
                   'A trusted Control response was not available for this check.',
-                  'Preview Control trust, TLS authorization or Edge self evidence was not proven.',
-                  'Cloudflare Edge was not observed for the Preview smoke.',
+                  'Test service trust, TLS authorization or self evidence was not proven.',
+                  'The test service was not observed.',
                 ]
-              : environment === 'cloudflare_edge'
+              : environment === 'netokay_test_service'
                 ? [
                     'A trusted Control response was not available for this check.',
-                    'TLS was attempted with default certificate verification for the Preview Edge.',
-                    'Cloudflare Edge was observed for the Preview smoke.',
+                    'TLS was attempted with default certificate verification for the test service.',
+                    'The test service was observed.',
                   ]
                 : [
                     'A trusted Control response was not available for this check.',
                     'TLS was attempted with default certificate verification for the local loopback harness.',
-                    'Cloudflare Edge was not observed for the local loopback harness.',
+                    'NetOkay public service was not observed for the local loopback harness.',
                   ]
         : [
             'A trusted Control response was not available for this check.',
             `Actual Control scheme attempted by this runner: ${actualScheme}.`,
-            'TLS and Cloudflare Edge were not observed for the local loopback harness.',
+            'TLS and the NetOkay public service were not observed for the local loopback harness.',
           ],
     source,
   };

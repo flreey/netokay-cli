@@ -5,7 +5,6 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
-  runDiagnostic,
   runDiagnosticAsync,
   finalizeRun,
   CORE_VERSION,
@@ -39,7 +38,6 @@ import {
   type TargetPolicyDecision,
   type TargetPolicyOptions,
 } from './target-policy.js';
-import { parsePreviewUrl } from './preview-url.js';
 import {
   OutputError,
   preflightEvidencePath,
@@ -48,9 +46,10 @@ import {
   type PublishEvidenceResult,
   type PublishEvidenceOptions,
 } from './output.js';
+import { createNetworkRouteResolver, type NetworkRoute } from './network-route.js';
 
-const CLI_VERSION = '0.1.0' as const;
-const SCHEMA_VERSION = '1.0' as const;
+const CLI_VERSION = '0.2.0' as const;
+const SCHEMA_VERSION = '2.0' as const;
 const CONTROL_PROFILE_VERSION = '1.0.0' as const;
 const CONTROL_TOTAL_DEADLINE_MS = 20_000;
 const CONTROL_ATTEMPT_DEADLINE_MS = 5_000;
@@ -86,15 +85,21 @@ export interface CliRuntimeDependencies {
   ) => Promise<TargetPolicyDecision>;
   /** Test-only transport seam; production always uses the bounded Node executor. */
   readonly controlTransport?: TransportExecutor;
+  /** Test-only control endpoint/mode seam; never parsed from public argv. */
+  readonly testControl?: Readonly<{ baseUrl: URL; mode: ControlMode }>;
 }
 
 const writeStdout = async (value: string): Promise<void> => {
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     let writeCallback = false;
+    const cleanup = (): void => {
+      process.stdout.removeListener('error', onError);
+    };
     const onError = (error: Error): void => {
       if (settled) return;
       settled = true;
+      cleanup();
       reject(error);
     };
     process.stdout.once('error', onError);
@@ -107,6 +112,7 @@ const writeStdout = async (value: string): Promise<void> => {
         setImmediate(() => {
           if (settled || !writeCallback) return;
           settled = true;
+          cleanup();
           resolve();
         });
       });
@@ -120,9 +126,13 @@ const writeStderr = async (value: string): Promise<void> => {
   await new Promise<void>((resolve) => {
     let settled = false;
     let writeCallback = false;
+    const cleanup = (): void => {
+      process.stderr.removeListener('error', onError);
+    };
     const finish = (): void => {
       if (settled) return;
       settled = true;
+      cleanup();
       resolve();
     };
     const onError = (): void => finish();
@@ -278,9 +288,15 @@ const detectExecutionContext = (): DiagnosticRequest['execution_context'] => {
   const platform = process.platform;
   const architecture = process.arch;
   const isContainer = process.env.NETOKAY_CONTAINER === '1';
-  const proxyEnvPresent = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY'].some(
-    (key) => process.env[key] !== undefined,
-  );
+  const proxyEnvPresent = [
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'ALL_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'all_proxy',
+  ].some((key) => process.env[key] !== undefined);
+  const noProxyPresent = ['NO_PROXY', 'no_proxy'].some((key) => process.env[key] !== undefined);
   return {
     kind: process.env.CI ? 'ci' : isContainer ? 'container' : 'local_shell',
     agent_host: 'unknown',
@@ -288,7 +304,7 @@ const detectExecutionContext = (): DiagnosticRequest['execution_context'] => {
     architecture: architecture === 'arm64' || architecture === 'x64' ? architecture : 'unknown',
     container: isContainer ? 'true' : 'unknown',
     proxy_env_present: proxyEnvPresent ? 'true' : 'false',
-    no_proxy_present: process.env.NO_PROXY === undefined ? 'false' : 'true',
+    no_proxy_present: noProxyPresent ? 'true' : 'false',
     extra_ca_present: 'unknown',
     agent_internal_runtime: 'not_observed',
   };
@@ -340,8 +356,7 @@ const isLoopbackHost = (hostname: string): boolean => {
   return family === 6 && normalized === '::1';
 };
 
-export const parseControlBaseUrl = (value: string, allowPreviewEdge = false): URL | null => {
-  if (allowPreviewEdge) return parsePreviewUrl(value);
+export const parseControlBaseUrl = (value: string, _allowPreviewEdge = false): URL | null => {
   try {
     const url = new URL(value);
     if (
@@ -361,17 +376,32 @@ export const parseControlBaseUrl = (value: string, allowPreviewEdge = false): UR
   }
 };
 
-/**
- * Preview Control has a stricter DNS boundary than the ordinary loopback
- * Control URL. Callers must use the canonical workers.dev Preview hostname,
- * and only public addresses returned by this one policy evaluation may reach
- * the transport socket.
- */
+const parseTestControlUrl = (value: string): URL | null => {
+  try {
+    const url = new URL(value);
+    if (
+      !['http:', 'https:'].includes(url.protocol) ||
+      url.username !== '' ||
+      url.password !== '' ||
+      url.search !== '' ||
+      url.hash !== '' ||
+      url.pathname !== '/' ||
+      !url.hostname.includes('.')
+    ) {
+      return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+};
+
+/** Test-only Control policy seam; public invocations use the fixed service. */
 export const evaluatePreviewControlPolicy = async (
   value: string | URL,
   options: Omit<TargetPolicyOptions, 'proxy_configured'> = {},
 ): Promise<TargetPolicyDecision> => {
-  const url = parsePreviewUrl(typeof value === 'string' ? value : value.href);
+  const url = parseTestControlUrl(typeof value === 'string' ? value : value.href);
   if (!url) {
     return {
       kind: 'blocked',
@@ -382,11 +412,7 @@ export const evaluatePreviewControlPolicy = async (
   return evaluateTargetPolicy(url.href, { ...options, proxy_configured: false });
 };
 
-/**
- * Public Control is a fixed, production-only root. It uses the same complete
- * DNS/IP policy and approved-address socket pinning as Preview, but is never
- * selected from arbitrary caller input.
- */
+/** The public service is a fixed root and is never selected from caller input. */
 export const evaluatePublicControlPolicy = async (
   value: string | URL,
   options: Omit<TargetPolicyOptions, 'proxy_configured'> = {},
@@ -453,41 +479,60 @@ const runControlDiagnose = async (
   const onSigint = (): void => controller.abort();
   process.once('SIGINT', onSigint);
   const remotePreview = mode !== 'local';
+  const routeResolver = createNetworkRouteResolver();
   type ControlObservationContext = {
-    source: 'cloudflare_control' | 'local_runner';
+    source: 'netokay_control' | 'local_runner';
     environment: string;
     actualScheme: string;
+    route?: NetworkRoute;
   };
+  const configuredPolicyEvaluator =
+    mode === 'public'
+      ? dependencies.publicControlPolicyEvaluator
+      : dependencies.previewPolicyEvaluator;
+  const previewPolicy = remotePreview
+    ? await (
+        configuredPolicyEvaluator ??
+        (mode === 'public' ? evaluatePublicControlPolicy : evaluatePreviewControlPolicy)
+      )(baseUrl, {
+        signal: controller.signal,
+        deadlineAt,
+        ...(configuredPolicyEvaluator ? {} : { routeResolver }),
+      })
+    : null;
+  const controlRoute =
+    previewPolicy?.kind === 'allowed'
+      ? (previewPolicy.route ?? {
+          route_kind: 'direct',
+          route_source: 'direct',
+          resolution_source: 'local',
+          destination_ip_observed: true,
+        })
+      : routeResolver.resolve(baseUrl);
   const unverifiedContext: ControlObservationContext = {
     source: 'local_runner',
     environment:
       mode === 'public'
-        ? 'cloudflare_public_unverified'
+        ? 'netokay_public_unverified'
         : mode === 'preview'
-          ? 'cloudflare_preview_unverified'
+          ? 'netokay_test_unverified'
           : 'local_loopback_harness',
     actualScheme: baseUrl.protocol.replace(':', ''),
+    route: controlRoute,
   };
   const verifiedContext: ControlObservationContext = remotePreview
     ? {
-        source: 'cloudflare_control',
-        environment: mode === 'public' ? 'cloudflare_public_edge' : 'cloudflare_edge',
+        source: 'netokay_control',
+        environment: mode === 'public' ? 'netokay_public_service' : 'netokay_test_service',
         actualScheme: baseUrl.protocol.replace(':', ''),
+        route: controlRoute,
       }
     : unverifiedContext;
-  const previewPolicy = remotePreview
-    ? await (
-        mode === 'public'
-          ? (dependencies.publicControlPolicyEvaluator ?? evaluatePublicControlPolicy)
-          : (dependencies.previewPolicyEvaluator ?? evaluatePreviewControlPolicy)
-      )(baseUrl, {
-        signal: controller.signal,
-        deadlineAt,
-      })
-    : null;
   const approvedControlAddresses =
     previewPolicy?.kind === 'allowed' ? previewPolicy.approved_ips : undefined;
+  const controlUsesSyntheticAddresses = controlRoute.route_source === 'transparent';
   const approvedControlSocket = (result: TransportResult): boolean =>
+    (controlRoute.route_kind === 'proxy' && !controlUsesSyntheticAddresses) ||
     Boolean(
       result.remoteAddress &&
       approvedControlAddresses?.some(
@@ -498,16 +543,23 @@ const runControlDiagnose = async (
   const targetPort = target
     ? createTargetPort({
         executor,
-        proxyConfigured: executionContext.proxy_env_present === 'true',
+        routeResolver,
+        proxyConfigured: false,
       })
     : undefined;
   const requestOptions = (runDeadlineAt: number, signal: AbortSignal = controller.signal) => ({
     deadlineAt: Math.min(deadlineAt, runDeadlineAt),
     signal,
-    ...(approvedControlAddresses
-      ? { approvedAddresses: approvedControlAddresses, serverName: baseUrl.hostname }
+    ...(approvedControlAddresses &&
+    (controlRoute.route_kind !== 'proxy' || controlUsesSyntheticAddresses)
+      ? {
+          approvedAddresses: approvedControlAddresses,
+          serverName: baseUrl.hostname,
+        }
       : {}),
+    route: controlRoute,
     headers: {
+      accept: 'application/json',
       'x-netokay-run-id': runId,
       'x-netokay-challenge': challenge,
       'x-netokay-client-version': CLI_VERSION,
@@ -541,6 +593,7 @@ const runControlDiagnose = async (
     result: TransportResult,
     startedAt: string,
     context: ControlObservationContext,
+    durationMs = durationFrom(startedAt),
   ): Observation => {
     const reason = transportReason(result);
     return failedControlObservation(
@@ -549,7 +602,7 @@ const runControlDiagnose = async (
       reason,
       reason,
       startedAt,
-      durationFrom(startedAt),
+      durationMs,
       context,
     );
   };
@@ -611,9 +664,16 @@ const runControlDiagnose = async (
           runContext.signal,
         ),
       );
+      const selfDurationMs = durationFrom(startedAt);
       const selfBody = parse(selfResult);
       if (selfBody === null) {
-        const failed = failure('control-self', selfResult, startedAt, unverifiedContext);
+        const failed = failure(
+          'control-self',
+          selfResult,
+          startedAt,
+          unverifiedContext,
+          selfDurationMs,
+        );
         observations.push(failed);
         return {
           observations,
@@ -630,7 +690,7 @@ const runControlDiagnose = async (
             'CONTROL_PROFILE_INCOMPATIBLE',
             'CONTROL_PROFILE_INCOMPATIBLE',
             startedAt,
-            durationFrom(startedAt),
+            selfDurationMs,
             unverifiedContext,
           ),
         );
@@ -645,7 +705,7 @@ const runControlDiagnose = async (
             selfRead.reasonCode,
             selfRead.reasonCode,
             startedAt,
-            durationFrom(startedAt),
+            selfDurationMs,
             unverifiedContext,
           ),
         );
@@ -667,7 +727,7 @@ const runControlDiagnose = async (
             failureReason,
             failureReason,
             startedAt,
-            durationFrom(startedAt),
+            selfDurationMs,
             unverifiedContext,
           ),
         );
@@ -677,7 +737,7 @@ const runControlDiagnose = async (
         selfObservation(
           selfRead.value,
           startedAt,
-          durationFrom(startedAt),
+          selfDurationMs,
           mode === 'public' ? unverifiedContext : verifiedContext,
         ),
       );
@@ -793,7 +853,7 @@ const runControlDiagnose = async (
         observations[0] = selfObservation(
           selfRead.value,
           startedAt,
-          durationFrom(startedAt),
+          selfDurationMs,
           verifiedContext,
         );
       }
@@ -823,96 +883,45 @@ const runControlDiagnose = async (
   }
 };
 
-const runTargetOnlyDiagnose = async (
-  target: string,
-  outputPath?: string,
-  dependencies: CliRuntimeDependencies = {},
-): Promise<number> => {
-  const executor = createNodeTransportExecutor({ maxResponseBytes: 32 * 1024 });
-  const controller = new AbortController();
-  const deadlineAt = Date.now() + CONTROL_TOTAL_DEADLINE_MS;
-  const deadlineTimer = setTimeout(() => controller.abort(), CONTROL_TOTAL_DEADLINE_MS);
-  const onSigint = (): void => controller.abort();
-  process.once('SIGINT', onSigint);
-  const executionContext = detectExecutionContext();
-  const targetPort = createTargetPort({
-    executor,
-    proxyConfigured: executionContext.proxy_env_present === 'true',
-  });
-  const request: DiagnosticRequest = {
-    transport: intentTransportForTarget(target),
-    profile_id: 'netokay-control-s3-local',
-    target,
-    execution_context: executionContext,
-    policy_version: 's3-target-policy',
-  };
-  try {
-    const bundle = await runDiagnosticAsync(
-      request,
-      { ...ports(dependencies), target: targetPort },
-      { signal: controller.signal, deadlineAt },
-    );
-    return emitBundle(request, bundle, outputPath, dependencies);
-  } finally {
-    clearTimeout(deadlineTimer);
-    process.removeListener('SIGINT', onSigint);
-  }
-};
-
 const runDiagnose = async (
   target: string | undefined,
-  controlBaseUrl?: URL,
   outputPath?: string,
   dependencies: CliRuntimeDependencies = {},
-  controlMode: ControlMode = 'local',
 ): Promise<number> => {
-  if (controlBaseUrl)
-    return runControlDiagnose(controlBaseUrl, target, outputPath, dependencies, controlMode);
-  if (target) return runTargetOnlyDiagnose(target, outputPath, dependencies);
-  const request: DiagnosticRequest = {
-    transport: 'https',
-    profile_id: 'netokay-control-s1',
+  const testControl = dependencies.testControl;
+  return runControlDiagnose(
+    testControl?.baseUrl ?? new URL(PUBLIC_CONTROL_BASE_URL),
     target,
-    execution_context: detectExecutionContext(),
-  };
-  const bundle = runDiagnostic(request, ports(dependencies));
-  return emitBundle(request, bundle, outputPath, dependencies);
+    outputPath,
+    dependencies,
+    testControl?.mode ?? 'public',
+  );
 };
 
 const requestForCliDiagnose = (
   target: string | undefined,
-  controlBaseUrl: URL | undefined,
-  controlMode: ControlMode = 'local',
+  mode: ControlMode = 'public',
 ): DiagnosticRequest => ({
   transport: intentTransportForTarget(target),
-  profile_id: controlBaseUrl
-    ? target
-      ? controlMode === 'public'
-        ? 'netokay-control-s3-public'
-        : 'netokay-control-s3-local'
-      : controlMode === 'public'
-        ? 'netokay-control-s2-public'
-        : 'netokay-control-s2-local'
-    : target
-      ? 'netokay-control-s3-local'
-      : 'netokay-control-s1',
+  profile_id: target
+    ? mode === 'public'
+      ? 'netokay-control-s3-public'
+      : 'netokay-control-s3-local'
+    : mode === 'public'
+      ? 'netokay-control-s2-public'
+      : 'netokay-control-s2-local',
   target,
   execution_context: detectExecutionContext(),
-  policy_version: controlBaseUrl
-    ? target
-      ? controlMode === 'public'
-        ? 's3-target-policy-public'
-        : 's3-target-policy'
-      : controlMode === 'public'
-        ? 's2-control-only-public'
-        : 's2-control-only'
-    : target
-      ? 's3-target-policy'
-      : undefined,
+  policy_version: target
+    ? mode === 'public'
+      ? 's3-target-policy-public'
+      : 's3-target-policy'
+    : mode === 'public'
+      ? 's2-control-only-public'
+      : 's2-control-only',
 });
 
-const usage = (): string =>
-  'Usage: netokay <version|schema|diagnose [target] [--control netokay-public | --control-base-url <loopback-http-url> [--preview-edge]] [--out <path>]>\n';
+const usage = (): string => 'Usage: netokay <version|schema|diagnose [target] [--out <path>]>\n';
 
 export async function main(
   argv: readonly string[] = process.argv.slice(2),
@@ -947,17 +956,11 @@ export async function main(
   }
   if (command === 'diagnose') {
     let target: string | undefined;
-    let controlBaseUrl: URL | undefined;
     let outputPath: string | undefined;
-    let previewEdge = false;
-    let controlMode: ControlMode = 'local';
     try {
       const parsed = parseArgs({
         args: rest,
         options: {
-          control: { type: 'string' },
-          'control-base-url': { type: 'string' },
-          'preview-edge': { type: 'boolean' },
           out: { type: 'string' },
         },
         allowPositionals: true,
@@ -965,28 +968,6 @@ export async function main(
       });
       if (parsed.positionals.length > 1) throw new Error('too many positionals');
       target = parsed.positionals[0];
-      previewEdge = parsed.values['preview-edge'] === true;
-      const controlValue = parsed.values['control-base-url'];
-      if (controlValue !== undefined && typeof controlValue !== 'string') {
-        throw new Error('invalid control URL');
-      }
-      if (previewEdge && controlValue === undefined) throw new Error('invalid control URL');
-      const selectedControl = parsed.values.control;
-      if (selectedControl !== undefined && typeof selectedControl !== 'string') {
-        throw new Error('invalid control selector');
-      }
-      if (selectedControl !== undefined) {
-        if (selectedControl !== 'netokay-public') throw new Error('invalid control selector');
-        if (controlValue !== undefined || previewEdge) throw new Error('incompatible control');
-        controlMode = 'public';
-        controlBaseUrl = new URL(PUBLIC_CONTROL_BASE_URL);
-      }
-      if (controlValue !== undefined) {
-        const parsedControlBaseUrl = parseControlBaseUrl(controlValue, previewEdge);
-        if (parsedControlBaseUrl === null) throw new Error('invalid control URL');
-        controlBaseUrl = parsedControlBaseUrl;
-        if (previewEdge) controlMode = 'preview';
-      }
       const outputValue = parsed.values.out;
       if (outputValue !== undefined && typeof outputValue !== 'string') {
         throw new Error('invalid output path');
@@ -997,9 +978,9 @@ export async function main(
       return 64;
     }
     try {
-      return await runDiagnose(target, controlBaseUrl, outputPath, dependencies, controlMode);
+      return await runDiagnose(target, outputPath, dependencies);
     } catch {
-      const request = requestForCliDiagnose(target, controlBaseUrl, controlMode);
+      const request = requestForCliDiagnose(target, dependencies.testControl?.mode ?? 'public');
       const bundle = terminalErrorBundle(request, dependencies);
       return emitBundle(request, bundle, outputPath, dependencies);
     }

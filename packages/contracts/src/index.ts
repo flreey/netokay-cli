@@ -14,7 +14,7 @@ export const validateEvidenceBundle = (value: unknown): value is EvidenceBundle 
 export const evidenceBundleValidationErrors = (): readonly unknown[] =>
   generatedValidator.errors ?? [];
 
-export const evidenceBundleSchemaVersion = '1.0' as const;
+export const evidenceBundleSchemaVersion = '2.0' as const;
 
 export const validateControlResponse = (value: unknown): value is ControlResponse =>
   generatedControlValidator(value) as boolean;

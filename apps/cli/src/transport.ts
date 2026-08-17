@@ -5,6 +5,7 @@ import type { ClientRequest, IncomingHttpHeaders, IncomingMessage } from 'node:h
 import type { LookupFunction } from 'node:net';
 import type { TLSSocket } from 'node:tls';
 import ipaddr from 'ipaddr.js';
+import type { NetworkRoute } from './network-route.js';
 
 export type TransportPhase =
   | 'response_complete'
@@ -34,6 +35,8 @@ export interface TransportRequestOptions {
   readonly approvedAddresses?: readonly string[];
   readonly serverName?: string;
   readonly readBody?: boolean;
+  /** Route selected by the shared policy seam; proxy credentials stay in memory. */
+  readonly route?: NetworkRoute;
 }
 
 export interface TransportResult {
@@ -202,6 +205,18 @@ export const createNodeTransportExecutor = (
           resolve(result('cancelled', null, new Headers(), null, 'ABORTED'));
           return;
         }
+        if (
+          requestOptions.route?.route_kind === 'proxy' &&
+          requestOptions.route.route_source !== 'transparent' &&
+          !requestOptions.route.proxyEnv
+        ) {
+          resolve(
+            result('connect_error', null, new Headers(), null, 'PROXY_ROUTE_UNAVAILABLE', {
+              failedStage: 'tcp',
+            }),
+          );
+          return;
+        }
         const controller = new AbortController();
         let timedOut = false;
         let cancelled = false;
@@ -302,8 +317,16 @@ export const createNodeTransportExecutor = (
                 keepAlive: false,
                 rejectUnauthorized: true,
                 ...(options.ca ? { ca: options.ca } : {}),
+                ...(requestOptions.route?.route_kind === 'proxy' && requestOptions.route.proxyEnv
+                  ? { proxyEnv: requestOptions.route.proxyEnv }
+                  : {}),
               })
-            : new HttpAgent({ keepAlive: false });
+            : new HttpAgent({
+                keepAlive: false,
+                ...(requestOptions.route?.route_kind === 'proxy' && requestOptions.route.proxyEnv
+                  ? { proxyEnv: requestOptions.route.proxyEnv }
+                  : {}),
+              });
         let timer: ReturnType<typeof setTimeout>;
         const onAbort = (): void => {
           cancelled = true;
@@ -387,7 +410,6 @@ export const createNodeTransportExecutor = (
             method: requestOptions.method ?? 'GET',
             headers: {
               connection: 'close',
-              accept: 'application/json',
               host: url.host,
               ...requestOptions.headers,
             },

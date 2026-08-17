@@ -26,7 +26,7 @@
   "properties": {
     "schema_version": {
       "type": "string",
-      "pattern": "^1\\.[0-9]+$"
+      "pattern": "^2\\.[0-9]+$"
     },
     "bundle_id": {
       "type": "string",
@@ -221,7 +221,7 @@
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
         },
-        "source": { "type": "string", "enum": ["local_runner", "cloudflare_control"] },
+        "source": { "type": "string", "enum": ["local_runner", "netokay_control"] },
         "colo": { "type": "string", "minLength": 1, "maxLength": 32 }
       },
       "allOf": [

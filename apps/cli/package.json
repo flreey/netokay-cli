@@ -1,6 +1,6 @@
 {
   "name": "netokay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "NetOkay executable diagnostic contract spine",
   "type": "module",
   "bin": {

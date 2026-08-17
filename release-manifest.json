@@ -3,21 +3,21 @@
   "phase": "prepare",
   "allowlist_version": "1",
   "exporter_version": "1.0.0",
-  "private_source_commit": "83fe5f794175e35df01f21ffe90ce380f4d4fa31",
+  "private_source_commit": "f961848a3893c75a28b9fcee732e76705e45cad2",
   "public_source_commit": null,
   "worker_version": null,
-  "npm_version": "0.1.0",
+  "npm_version": "0.2.0",
   "production_control_url": null,
   "schema_hashes": {
     "control": "6272d78cf0922d86a2cae1e04f88089d17ee28a8dc80c886d9eb05ad17f9d439",
-    "evidence": "d17492d92384193291fff4713e50af9abbbc47075f5797bb08b4cdd383777024"
+    "evidence": "d9a0e2ff1e044d8effc56cd6affde998b65c312531cc9fdaf5acc4678c5e9e51"
   },
   "tarball_sha256": null,
   "version_matrix": {
-    "cli": "0.1.0",
-    "core": "0.1.0",
-    "contracts": "0.1.0",
-    "schema": "1.0",
+    "cli": "0.2.0",
+    "core": "0.2.0",
+    "contracts": "0.2.0",
+    "schema": "2.0",
     "control_profile": "1.0.0"
   }
 }

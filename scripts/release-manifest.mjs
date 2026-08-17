@@ -17,7 +17,6 @@ const COMMIT = /^[a-f0-9]{40}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const SCHEMA = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const WORKER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const PRODUCTION_WORKER_NAME = 'netokay-control';
 const EXACT_FIELDS = [
   'manifest_version',
   'phase',
@@ -59,7 +58,7 @@ const validUrl = (value) => {
     )
       return false;
     const hostname = url.hostname.toLowerCase();
-    if (isIP(hostname) || !hostname.includes('.') || hostname.endsWith('.')) return false;
+    if (isIP(hostname) || hostname !== 'netokay.net') return false;
     if (
       hostname === 'localhost' ||
       hostname === 'example.com' ||
@@ -89,11 +88,6 @@ const validUrl = (value) => {
             label,
           ),
         )
-    )
-      return false;
-    if (
-      hostname.endsWith('.workers.dev') &&
-      (labels.length !== 4 || labels[0] !== PRODUCTION_WORKER_NAME)
     )
       return false;
     return true;
@@ -160,7 +154,7 @@ const checkoutReleaseValues = async () => {
     cli: cli.version,
     core: core.version,
     contracts: contracts.version,
-    schema: '1.0',
+    schema: '2.0',
     control_profile: '1.0.0',
   };
   const schema_hashes = {
